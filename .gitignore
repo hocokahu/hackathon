@@ -260,3 +260,4 @@ secrets.toml
 .claude/settings.local.json
 .planning/
 bloomreach_hackathon.md
+test/
