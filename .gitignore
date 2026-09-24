@@ -258,3 +258,5 @@ secrets.toml
 
 # Claude Code local settings (holds MCP secrets)
 .claude/settings.local.json
+.planning/
+bloomreach_hackathon.md
