@@ -9,8 +9,16 @@ across four platforms (Bloomreach, Google/Gemini, Shopify, Databricks). Full det
 1. **Check, don't guess.** Before stating anything as fact, confirm it with the real thing —
    the API, an MCP tool, the CLI, or the browser. If you can't verify it, say so plainly. Never
    report a result you did not actually observe.
-2. **Plain language.** Explain simply. Spell out any technical term the first time you use it.
-   No unexplained jargon.
+2. **Write for a busy human.** Be precise, short, and easy to read.
+   - **Simple words, no jargon.** Explain things plainly. If you must use a technical term,
+     say what it means in a few words the first time.
+   - **Easy to scan.** Lead with the answer. Use short sentences, bullets, and small tables.
+     Cut filler and repetition. Don't wall-of-text.
+   - **Always end with "What you (the human) do next."** A short, numbered list of the exact
+     steps the person should take — plain clicks/commands, in order. If nothing is needed from
+     them, say "Nothing needed from you."
+   - **Be honest and exact.** Say what actually happened, what worked, what didn't, and why.
+     No vague claims.
 3. **Never attribute commits to Claude.** Do not add a `Co-Authored-By: Claude` line — or any
    Claude/AI co-author or attribution — to git commits or pull requests.
 4. **Protect other accounts on this machine** (see next section).
