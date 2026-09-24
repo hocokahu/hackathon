@@ -1,0 +1,31 @@
+{
+  "_comment": "Template for .mcp.json (safe to commit). Replace <workspace>/<store> with your values. The real .mcp.json in this repo has no secrets either — the Databricks token is read from .claude/settings.local.json via ${DATABRICKS_TOKEN}.",
+  "mcpServers": {
+    "loomi-connect": {
+      "type": "http",
+      "url": "https://brx.connect.loomi.ai/mcp"
+    },
+    "shopify-dev": {
+      "command": "npx",
+      "args": ["-y", "@shopify/dev-mcp@latest"]
+    },
+    "shopify-storefront": {
+      "type": "http",
+      "url": "https://<store>.myshopify.com/api/mcp"
+    },
+    "databricks-genie": {
+      "type": "http",
+      "url": "https://<workspace>.cloud.databricks.com/api/2.0/mcp/genie",
+      "headers": {
+        "Authorization": "Bearer ${DATABRICKS_TOKEN}"
+      }
+    },
+    "databricks-uc-functions": {
+      "type": "http",
+      "url": "https://<workspace>.cloud.databricks.com/api/2.0/mcp/functions/<catalog>/<schema>",
+      "headers": {
+        "Authorization": "Bearer ${DATABRICKS_TOKEN}"
+      }
+    }
+  }
+}

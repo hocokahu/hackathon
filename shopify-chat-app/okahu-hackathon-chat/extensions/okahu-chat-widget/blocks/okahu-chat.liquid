@@ -1,0 +1,35 @@
+{% comment %}
+  Okahu Hackathon — storefront chat widget (Theme App Extension app embed block).
+  Renders a bottom-right chat bubble on every storefront page (target: body).
+  The widget self-mounts; backend is wired via window.OKAHU_CHAT.onSend later
+  (Gemini + Loomi + Shopify orchestrator).
+{% endcomment %}
+<script>
+  window.OKAHU_CHAT = window.OKAHU_CHAT || {};
+  window.OKAHU_CHAT.config = {
+    greeting: {{ block.settings.greeting | default: "Hi 👋 I'm your shopping assistant. I already know your style and what's in your cart." | json }},
+    backendUrl: {{ block.settings.backend_url | default: "" | json }},
+    shop: {{ shop.permanent_domain | json }}
+  };
+</script>
+<script src="{{ 'okahu-chat.js' | asset_url }}" defer></script>
+
+{% schema %}
+{
+  "name": "Okahu Chat Widget",
+  "target": "body",
+  "settings": [
+    {
+      "type": "text",
+      "id": "greeting",
+      "label": "Greeting message",
+      "default": "Hi 👋 I'm your shopping assistant. I already know your style and what's in your cart."
+    },
+    {
+      "type": "url",
+      "id": "backend_url",
+      "label": "Backend endpoint (Gemini + Loomi orchestrator)"
+    }
+  ]
+}
+{% endschema %}

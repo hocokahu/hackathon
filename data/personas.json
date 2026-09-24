@@ -1,0 +1,157 @@
+{
+  "_meta": {
+    "purpose": "Joint (linked) customer data for the Composable AI Hackathon T6 demo. The SAME 5 people exist in all three systems, joined on the identity spine = email. This is the source of truth; loaders write these rows into Databricks (00data), Bloomreach/Loomi (gentle-gyroscope), and Shopify (okahu-hackathon).",
+    "identity_spine": "email",
+    "email_convention": "hoc+<alias>@okahu.ai — plus-addressing so every persona's mail lands in the real owner@example.com inbox and activation emails are actually deliverable/verifiable.",
+    "id_map": {
+      "databricks.customer_id": "CUST-1001..1005 (new range, no collision with existing CUST-00xx synthetic rows)",
+      "bloomreach.email_id": "= email (hard identifier)",
+      "bloomreach.shopify_id": "filled after the Shopify customer is created (soft id, bridges to store)",
+      "shopify.id": "assigned by Shopify on create"
+    },
+    "generated": "2026-09-23",
+    "notes": "Phone numbers are placeholder E.164 test values; replace with a real number before any SMS test (and note: no SMS provider is configured in Bloomreach yet). Scores/segments are internally coherent per each persona's story so the churn/retention/personalization demo tells a clear story."
+  },
+  "personas": [
+    {
+      "persona_id": "P1",
+      "story": "VIP loyalist — high value, very low churn risk, high propensity. Demo path: reward + upsell to the next tier.",
+      "identity": {
+        "first_name": "Ava", "last_name": "Chen",
+        "email": "hoc+ava@okahu.ai", "phone": "+15550100101",
+        "city": "Seattle", "state_province": "WA", "country_code": "US", "locale": "en"
+      },
+      "databricks": {
+        "customer_id": "CUST-1001", "segment": "VIP", "loyalty_tier": "Platinum",
+        "signup_date": "2022-03-14", "marketing_opt_in": true, "account_status": "active",
+        "days_since_last_purchase": 6, "purchases_30d": 3, "purchases_90d": 8,
+        "spend_30d": 512.40, "spend_90d": 1486.90, "lifetime_value": 9820.55,
+        "average_order_value": 185.86, "engagement_events_30d": 41, "recency_score": 0.94,
+        "favorite_category": "Electronics", "churn_probability": 0.06,
+        "purchase_propensity_score": 0.88, "predicted_next_category": "Accessories"
+      },
+      "bloomreach": {
+        "email_id": "hoc+ava@okahu.ai", "shopify_id": null, "cookie": "persona-ava-0001",
+        "email_marketing_consent": "subscribed", "sms_marketing_consent": "subscribed",
+        "enrichment": { "churn_risk_band": "low", "style_persona": "premium_early_adopter", "pltv_band": "high", "next_best_category": "Accessories" }
+      },
+      "shopify": {
+        "first_name": "Ava", "last_name": "Chen", "email": "hoc+ava@okahu.ai", "phone": "+15550100101",
+        "tags": ["vip", "platinum", "persona:P1"], "accepts_marketing": true,
+        "past_orders": [{ "name": "#1001", "total": 189.00, "items": 2, "days_ago": 6 }, { "name": "#1000", "total": 232.50, "items": 3, "days_ago": 21 }]
+      }
+    },
+    {
+      "persona_id": "P2",
+      "story": "AT-RISK high-value — high LTV but churn risk spiking (this is the hero RETENTION scenario: Databricks churn score -> Bloomreach journey -> win-them-back email/SMS + offer).",
+      "identity": {
+        "first_name": "Marcus", "last_name": "Bello",
+        "email": "hoc+marcus@okahu.ai", "phone": "+15550100102",
+        "city": "Austin", "state_province": "TX", "country_code": "US", "locale": "en"
+      },
+      "databricks": {
+        "customer_id": "CUST-1002", "segment": "High-Value", "loyalty_tier": "Gold",
+        "signup_date": "2021-09-02", "marketing_opt_in": true, "account_status": "active",
+        "days_since_last_purchase": 74, "purchases_30d": 0, "purchases_90d": 1,
+        "spend_30d": 0.00, "spend_90d": 154.00, "lifetime_value": 6240.00,
+        "average_order_value": 156.00, "engagement_events_30d": 3, "recency_score": 0.21,
+        "favorite_category": "Apparel", "churn_probability": 0.79,
+        "purchase_propensity_score": 0.34, "predicted_next_category": "Outerwear"
+      },
+      "bloomreach": {
+        "email_id": "hoc+marcus@okahu.ai", "shopify_id": null, "cookie": "persona-marcus-0002",
+        "email_marketing_consent": "subscribed", "sms_marketing_consent": "subscribed",
+        "enrichment": { "churn_risk_band": "high", "style_persona": "classic_value", "pltv_band": "high", "next_best_category": "Outerwear" }
+      },
+      "shopify": {
+        "first_name": "Marcus", "last_name": "Bello", "email": "hoc+marcus@okahu.ai", "phone": "+15550100102",
+        "tags": ["at-risk", "gold", "persona:P2"], "accepts_marketing": true,
+        "past_orders": [{ "name": "#0902", "total": 154.00, "items": 1, "days_ago": 74 }, { "name": "#0855", "total": 198.00, "items": 2, "days_ago": 140 }]
+      }
+    },
+    {
+      "persona_id": "P3",
+      "story": "New customer — low LTV so far but high propensity. Demo path: onboarding / grow-the-relationship recommendations.",
+      "identity": {
+        "first_name": "Priya", "last_name": "Nair",
+        "email": "hoc+priya@okahu.ai", "phone": "+15550100103",
+        "city": "Jersey City", "state_province": "NJ", "country_code": "US", "locale": "en"
+      },
+      "databricks": {
+        "customer_id": "CUST-1003", "segment": "New", "loyalty_tier": "Silver",
+        "signup_date": "2026-08-30", "marketing_opt_in": true, "account_status": "active",
+        "days_since_last_purchase": 4, "purchases_30d": 1, "purchases_90d": 1,
+        "spend_30d": 64.00, "spend_90d": 64.00, "lifetime_value": 64.00,
+        "average_order_value": 64.00, "engagement_events_30d": 22, "recency_score": 0.90,
+        "favorite_category": "Home", "churn_probability": 0.31,
+        "purchase_propensity_score": 0.72, "predicted_next_category": "Home"
+      },
+      "bloomreach": {
+        "email_id": "hoc+priya@okahu.ai", "shopify_id": null, "cookie": "persona-priya-0003",
+        "email_marketing_consent": "subscribed", "sms_marketing_consent": "unsubscribed",
+        "enrichment": { "churn_risk_band": "medium", "style_persona": "home_explorer", "pltv_band": "growth", "next_best_category": "Home" }
+      },
+      "shopify": {
+        "first_name": "Priya", "last_name": "Nair", "email": "hoc+priya@okahu.ai", "phone": "+15550100103",
+        "tags": ["new", "silver", "persona:P3"], "accepts_marketing": true,
+        "past_orders": [{ "name": "#1120", "total": 64.00, "items": 1, "days_ago": 4 }]
+      }
+    },
+    {
+      "persona_id": "P4",
+      "story": "Price-sensitive / deal-seeker — medium churn, buys on discount. Demo path: offer-driven personalization, budget-friendly recs.",
+      "identity": {
+        "first_name": "Diego", "last_name": "Santos",
+        "email": "hoc+diego@okahu.ai", "phone": "+15550100104",
+        "city": "Miami", "state_province": "FL", "country_code": "US", "locale": "en"
+      },
+      "databricks": {
+        "customer_id": "CUST-1004", "segment": "Bargain-Hunter", "loyalty_tier": "Bronze",
+        "signup_date": "2023-11-19", "marketing_opt_in": true, "account_status": "active",
+        "days_since_last_purchase": 28, "purchases_30d": 1, "purchases_90d": 4,
+        "spend_30d": 39.00, "spend_90d": 176.00, "lifetime_value": 940.00,
+        "average_order_value": 44.00, "engagement_events_30d": 14, "recency_score": 0.58,
+        "favorite_category": "Accessories", "churn_probability": 0.47,
+        "purchase_propensity_score": 0.55, "predicted_next_category": "Electronics"
+      },
+      "bloomreach": {
+        "email_id": "hoc+diego@okahu.ai", "shopify_id": null, "cookie": "persona-diego-0004",
+        "email_marketing_consent": "subscribed", "sms_marketing_consent": "subscribed",
+        "enrichment": { "churn_risk_band": "medium", "style_persona": "deal_seeker", "pltv_band": "medium", "next_best_category": "Electronics" }
+      },
+      "shopify": {
+        "first_name": "Diego", "last_name": "Santos", "email": "hoc+diego@okahu.ai", "phone": "+15550100104",
+        "tags": ["deal-seeker", "bronze", "persona:P4"], "accepts_marketing": true,
+        "past_orders": [{ "name": "#1080", "total": 39.00, "items": 1, "days_ago": 28 }, { "name": "#1044", "total": 52.00, "items": 2, "days_ago": 61 }]
+      }
+    },
+    {
+      "persona_id": "P5",
+      "story": "Dormant / lapsed — was mid-value, now very high churn risk (win-back candidate). Demo path: reactivation with a strong incentive.",
+      "identity": {
+        "first_name": "Sophie", "last_name": "Laurent",
+        "email": "hoc+sophie@okahu.ai", "phone": "+15550100105",
+        "city": "Portland", "state_province": "OR", "country_code": "US", "locale": "en"
+      },
+      "databricks": {
+        "customer_id": "CUST-1005", "segment": "Lapsed", "loyalty_tier": "Silver",
+        "signup_date": "2022-06-07", "marketing_opt_in": true, "account_status": "active",
+        "days_since_last_purchase": 168, "purchases_30d": 0, "purchases_90d": 0,
+        "spend_30d": 0.00, "spend_90d": 0.00, "lifetime_value": 2130.00,
+        "average_order_value": 88.75, "engagement_events_30d": 1, "recency_score": 0.08,
+        "favorite_category": "Outerwear", "churn_probability": 0.91,
+        "purchase_propensity_score": 0.18, "predicted_next_category": "Apparel"
+      },
+      "bloomreach": {
+        "email_id": "hoc+sophie@okahu.ai", "shopify_id": null, "cookie": "persona-sophie-0005",
+        "email_marketing_consent": "subscribed", "sms_marketing_consent": "unsubscribed",
+        "enrichment": { "churn_risk_band": "critical", "style_persona": "seasonal_shopper", "pltv_band": "reactivate", "next_best_category": "Apparel" }
+      },
+      "shopify": {
+        "first_name": "Sophie", "last_name": "Laurent", "email": "hoc+sophie@okahu.ai", "phone": "+15550100105",
+        "tags": ["lapsed", "winback", "persona:P5"], "accepts_marketing": true,
+        "past_orders": [{ "name": "#0705", "total": 88.75, "items": 1, "days_ago": 168 }]
+      }
+    }
+  ]
+}

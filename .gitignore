@@ -216,3 +216,45 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+.gstack/
+
+# ===== macOS =====
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+.AppleDouble
+.LSOverride
+Icon
+*.icloud
+.fseventsd
+.TemporaryItems
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+.AppleDB
+.AppleDesktop
+Network Trash Folder
+Temporary Items
+.apdisk
+
+# ===== Secrets / credentials (hackathon) =====
+.env
+.env.*
+!.env.example
+.hackathon-browser.env
+*.pem
+*.key
+*_rsa
+*.p12
+service-account*.json
+service_account*.json
+gha-creds-*.json
+credentials.json
+client_secret*.json
+secrets.toml
+.databrickscfg
+.mcp.local.json
+
+# Claude Code local settings (holds MCP secrets)
+.claude/settings.local.json
