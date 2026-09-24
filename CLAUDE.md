@@ -4,6 +4,10 @@ What this repo is: our entry for the hackathon's **Track T6** — an AI shopping
 across four platforms (Bloomreach, Google/Gemini, Shopify, Databricks). Full details in
 **README.md**. Strategy notes in **bloomreach_hackathon.md**.
 
+**Our hackathon team name is "Team Mosaic."** Use it for team-facing branding — e.g. the storefront
+chat assistant is named "Team Mosaic Shopping Assistant." (Okahu is the company; Team Mosaic is our
+hackathon team identity.)
+
 ## How to work in this repo (rules for the AI)
 
 1. **Check, don't guess.** Before stating anything as fact, confirm it with the real thing —

@@ -8,7 +8,7 @@
   if (window.__okahuChatLoaded) return;
   window.__okahuChatLoaded = true;
 
-  var BRAND = { name: "Okahu Shopping Assistant", accent: "#0EA5A4", accentDark: "#0B7E7D", ink: "#0F172A", bubbleBg: "#0F172A" };
+  var BRAND = { name: "Team Mosaic Shopping Assistant", accent: "#0EA5A4", accentDark: "#0B7E7D", ink: "#0F172A", bubbleBg: "#0F172A" };
 
   var css = `
   .okc-btn{position:fixed;bottom:20px;right:20px;width:60px;height:60px;border-radius:50%;
