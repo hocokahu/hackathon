@@ -47,6 +47,18 @@ identifiers and credentials are in **`.env`**.
 - Do console/browser work in the separate "hackathon" Chrome profile so it never mixes with the everyday browser:
   `source .hackathon-browser.env` then `~/.claude/skills/gstack/browse/dist/browse connect`.
 
+## ⚠️ This repo is PUBLIC — no PII, no project identifiers in committed files
+Repo: **https://github.com/hocokahu/hackathon** (public). Anything committed is world-readable and stays in
+git history even after deletion.
+- **No real PII.** Don't commit real people's emails or names — yours or teammates'. Use placeholders
+  (`owner@example.com`, `teammate@example.com`) in tracked files; keep real contacts in `.env`.
+- **No project/infra identifiers** that aid an attacker: workspace hosts (e.g. `dbc-*.cloud.databricks.com`),
+  org/account ids, dev-store passwords. Reference them by `.env` variable name only.
+- **Synthetic/test data that merely *looks* like PII is fine** — fake persona emails (e.g. `hoc+ava@okahu.ai`
+  plus-addresses used as demo personas) and generated sample customer rows can stay.
+- If real PII/identifiers do land in a commit, redact the files **and** rewrite history (they're already
+  public, so also treat the exposed values as compromised).
+
 ## Secrets and config
 - Real credentials live in **`.env`** (never committed). Safe template: **`.env.example`**.
 - MCP secrets (e.g. the Databricks token) go in **`.claude/settings.local.json`** (never committed) and are referenced as `${NAME}` inside `.mcp.json`. Claude Code does not read `.env`, so secrets must live here or in the shell.
