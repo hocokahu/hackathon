@@ -26,6 +26,9 @@ hackathon team identity.)
 3. **Never attribute commits to Claude.** Do not add a `Co-Authored-By: Claude` line — or any
    Claude/AI co-author or attribution — to git commits or pull requests.
 4. **Protect other accounts on this machine** (see next section).
+5. **No Claude Artifacts.** Don't publish claude.ai Artifacts. For any HTML page, dashboard,
+   deck, or visual deliverable, write a **self-contained** HTML file into **`./tmp/`** (gitignored,
+   local-only) and give the local file path. Never commit `./tmp/`.
 
 ## ⛔ Other accounts may live on this machine — check before you act
 

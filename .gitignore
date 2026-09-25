@@ -261,3 +261,4 @@ secrets.toml
 .planning/
 bloomreach_hackathon.md
 test/
+tmp/
