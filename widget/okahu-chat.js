@@ -74,7 +74,7 @@
   var input = panel.querySelector("#okc-input");
 
   function scroll() { body.scrollTop = body.scrollHeight; }
-  function addMsg(text, who) { var m = el("div", "okc-msg " + (who === "user" ? "okc-user" : "okc-bot"), esc(text)); body.appendChild(m); scroll(); }
+  function addMsg(text, who) { var m = el("div", "okc-msg " + (who === "user" ? "okc-user" : "okc-bot"), esc(text)); body.appendChild(m); scroll(); return m; }
   function addChips(items) {
     var wrap = el("div", "okc-chips");
     items.forEach(function (t) { var c = el("button", "okc-chip", t); c.onclick = function () { send(t); }; wrap.appendChild(c); });
@@ -95,9 +95,39 @@
     body.appendChild(row); scroll();
   }
 
-  // Stubbed backend. Replace with a fetch() to your orchestrator (Gemini + Loomi + Shopify).
+  // Backend hook. Priority: custom onSend  >  configured HTTPS endpoint (Gemini orchestrator)  >  demo stub.
+  var history = [];
   function respond(text) {
-    if (window.OKAHU_CHAT && typeof window.OKAHU_CHAT.onSend === "function") { window.OKAHU_CHAT.onSend(text, { addMsg: addMsg, addCards: addCards, addChips: addChips }); return; }
+    var cfg = window.OKAHU_CHAT || {};
+    if (typeof cfg.onSend === "function") {
+      cfg.onSend(text, { addMsg: addMsg, addCards: addCards, addChips: addChips });
+      return;
+    }
+    if (cfg.endpoint) {
+      var typing = addMsg("…", "bot");
+      fetch(cfg.endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          message: text,
+          email: (window.OKAHU_CUSTOMER && window.OKAHU_CUSTOMER.email) || null,
+          customer_id: (window.OKAHU_CUSTOMER && window.OKAHU_CUSTOMER.id) || null,
+          history: history.slice(-10)
+        })
+      }).then(function (r) { return r.json(); }).then(function (d) {
+        if (typing) typing.remove();
+        var reply = (d && d.reply) || "Sorry — I couldn't reach the assistant just now.";
+        addMsg(reply, "bot");
+        if (d && d.cards && d.cards.length) addCards(d.cards);
+        if (d && d.chips && d.chips.length) addChips(d.chips);
+        history.push({ role: "user", text: text }, { role: "model", text: reply });
+      }).catch(function () {
+        if (typing) typing.remove();
+        addMsg("Hmm, I had trouble connecting. Please try again.", "bot");
+      });
+      return;
+    }
+    // Demo stub (no backend configured)
     addMsg("Because you're a Platinum member who loves minimalist styles, here are 3 picks I think you'll love:", "bot");
     addCards([
       { title: "Aperture Rain Jacket", price: "$189", why: "Matches your style persona", image: "https://placehold.co/150x96/0EA5A4/fff?text=Jacket" },
@@ -110,7 +140,7 @@
   function send(text) {
     text = (text || input.value || "").trim(); if (!text) return;
     addMsg(text, "user"); input.value = "";
-    setTimeout(function () { respond(text); }, 350);
+    respond(text);
   }
 
   panel.querySelector("#okc-send").onclick = function () { send(); };

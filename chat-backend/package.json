@@ -1,0 +1,8 @@
+{
+  "name": "okahu-chat-backend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Team Mosaic storefront chat backend — Gemini replies + Bloomreach attribute writes",
+  "engines": { "node": ">=20" },
+  "scripts": { "start": "node server.js" }
+}
