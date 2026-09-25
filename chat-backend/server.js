@@ -31,11 +31,21 @@ const SHOP_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN || "";
 const SHOP_TOKEN = process.env.SHOPIFY_ADMIN_API_TOKEN || "";
 const SHOP_VER = process.env.SHOPIFY_API_VERSION || "2025-01";
 
+// Databricks (optional) — mirror the chat signal into a Delta table so the Databricks agent can
+// reason over it. Uses the SQL Statement Execution API against a serverless warehouse. If unset,
+// the Databricks write is skipped and chat still works. Host/token/warehouse come from env.
+const DBX_HOST = (process.env.DATABRICKS_HOST || "").replace(/\/+$/, "");
+const DBX_TOKEN = process.env.DATABRICKS_TOKEN || "";
+const DBX_WAREHOUSE = process.env.DATABRICKS_WAREHOUSE_ID || "";
+const DBX_SIGNALS_TABLE = process.env.DATABRICKS_SIGNALS_TABLE || "workspace.default.mosaic_chat_signals";
+const DBX_READY = Boolean(DBX_HOST && DBX_TOKEN && DBX_WAREHOUSE);
+
 const SYSTEM_PROMPT = [
   "You are the Team Mosaic Shopping Assistant on an online store.",
   "Be warm, concise (1-3 sentences), and genuinely helpful with product discovery and styling.",
   "As you chat, quietly capture any durable shopper preferences they reveal:",
-  "favorite color, location/region, style preference, and budget band.",
+  "favorite color, location/region, style preference, budget band, and — especially for",
+  "outdoor or seasonal plans — their favorite activity, the place they are headed, and their summer interest.",
   "Only fill an attribute when the shopper actually states it; otherwise leave it out.",
   "Never invent order details or specific product/stock claims you weren't given.",
 ].join(" ");
@@ -53,6 +63,9 @@ const RESPONSE_SCHEMA = {
         preferred_location: { type: "string" },
         style_preference: { type: "string" },
         budget_band: { type: "string" },
+        favorite_activity: { type: "string", description: "e.g. hiking, snowboarding, running" },
+        favorite_location: { type: "string", description: "a place/destination the shopper is headed, e.g. Denver, the Rockies" },
+        summer_interest: { type: "string", description: "what they want to do this summer, e.g. hiking, trail running" },
       },
     },
   },
@@ -138,7 +151,10 @@ async function askGemini({ message, history }) {
 
 async function writeBloomreach({ email, customer_id, attributes }) {
   // Model output is untrusted: allowlist keys, cap length, reject markup/template/url/control chars.
-  const ALLOWED_ATTRS = { favorite_color: 60, preferred_location: 80, style_preference: 60, budget_band: 40 };
+  const ALLOWED_ATTRS = {
+    favorite_color: 60, preferred_location: 80, style_preference: 60, budget_band: 40,
+    favorite_activity: 60, favorite_location: 80, summer_interest: 60,
+  };
   const props = {};
   for (const [k, max] of Object.entries(ALLOWED_ATTRS)) {
     let v = attributes && attributes[k];
@@ -167,6 +183,40 @@ async function writeBloomreach({ email, customer_id, attributes }) {
   return { wrote: ok, props, status: resp.status }; // never return the upstream body to the client
 }
 
+// Mirror the extracted signal into Databricks (Delta table) so the Databricks agent can reason over it.
+// SQL string literals are built from allowlisted props (already validated) + a single-quote-escaped message.
+async function writeDatabricks({ email, attributes, message }) {
+  if (!DBX_READY || !email) return { dbx: false };
+  const ALLOWED = ["favorite_activity", "favorite_location", "summer_interest", "favorite_color", "style_preference", "budget_band"];
+  const q = (v) => (v == null ? null : `'${String(v).replace(/'/g, "''").slice(0, 200)}'`);
+  const cols = ["email", ...ALLOWED, "raw_message", "source", "created_at"];
+  const vals = [
+    q(email),
+    ...ALLOWED.map((k) => {
+      const v = attributes && attributes[k];
+      return typeof v === "string" && v.trim() ? q(v.trim()) : "NULL";
+    }),
+    q(String(message || "").slice(0, 500)),
+    q("storefront_chat"),
+    "current_timestamp()",
+  ];
+  const sql = `INSERT INTO ${DBX_SIGNALS_TABLE} (${cols.join(",")}) VALUES (${vals.join(",")})`;
+  try {
+    const resp = await fetch(`${DBX_HOST}/api/2.0/sql/statements`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${DBX_TOKEN}` },
+      body: JSON.stringify({ statement: sql, warehouse_id: DBX_WAREHOUSE, wait_timeout: "30s" }),
+    });
+    const j = await resp.json().catch(() => ({}));
+    const ok = (j && j.status && j.status.state === "SUCCEEDED");
+    if (!ok) console.error("databricks write failed", resp.status, JSON.stringify(j.status || {}).slice(0, 300));
+    return { dbx: ok };
+  } catch (e) {
+    console.error("databricks write error", String(e).slice(0, 300));
+    return { dbx: false };
+  }
+}
+
 // Resolve a shopper's email from their Shopify storefront customerId (read_customers). Returns null if unavailable.
 async function resolveEmail(customerId) {
   if (!SHOP_DOMAIN || !SHOP_TOKEN || !customerId) return null;
@@ -183,7 +233,7 @@ async function resolveEmail(customerId) {
 
 const server = http.createServer(async (req, res) => {
   if (req.method === "OPTIONS") { cors(res); res.writeHead(204); return res.end(); }
-  if (req.method === "GET") return json(res, 200, { ok: true, model: GEMINI_MODEL, bloomreach: BR_READY });
+  if (req.method === "GET") return json(res, 200, { ok: true, model: GEMINI_MODEL, bloomreach: BR_READY, databricks: DBX_READY });
   if (req.method !== "POST") return json(res, 405, { error: "method not allowed" });
 
   try {
@@ -198,11 +248,14 @@ const server = http.createServer(async (req, res) => {
     if (!idEmail && customer_id) { try { idEmail = await resolveEmail(customer_id); } catch {} }
 
     let wrote = { wrote: false };
+    let dbx = { dbx: false };
     if (idEmail) {
       try { wrote = await writeBloomreach({ email: idEmail, customer_id, attributes }); }
       catch (e) { console.error("bloomreach write error", String(e).slice(0, 300)); wrote = { wrote: false }; }
+      try { dbx = await writeDatabricks({ email: idEmail, attributes, message }); }
+      catch (e) { console.error("databricks write error", String(e).slice(0, 300)); dbx = { dbx: false }; }
     }
-    return json(res, 200, { reply, extracted: attributes, ...wrote });
+    return json(res, 200, { reply, extracted: attributes, ...wrote, ...dbx });
   } catch (e) {
     console.error("assistant error", String(e).slice(0, 300));
     return json(res, 500, { error: "assistant error" });
