@@ -16,7 +16,7 @@ const http = require("node:http");
 const PORT = process.env.PORT || 8080;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.8-flash";
-const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "https://okahu-hackathon.myshopify.com"; // no wildcard default
 
 // Bloomreach Engagement REST (all optional — if unset, attribute writes are skipped, chat still works)
 const BR_API_BASE = (process.env.BLOOMREACH_API_BASE || "").replace(/\/+$/, ""); // e.g. https://api.eu1.exponea.com
@@ -83,13 +83,14 @@ function readBody(req) {
 
 async function askGemini({ message, history }) {
   // Gemini Interactions API (the replacement for generateContent). Stateless: we pass full history.
+  const clip = (s) => String(s == null ? "" : s).slice(0, 2000); // cap per-turn text
   const input = [{ type: "text", text: SYSTEM_PROMPT }];
   for (const h of (Array.isArray(history) ? history : []).slice(-10)) {
     if (!h || !h.text) continue;
-    if (h.role === "model") input.push({ type: "model_output", content: [{ type: "text", text: String(h.text) }] });
-    else input.push({ type: "user_input", content: String(h.text) });
+    if (h.role === "model") input.push({ type: "model_output", content: [{ type: "text", text: clip(h.text) }] });
+    else input.push({ type: "user_input", content: clip(h.text) });
   }
-  input.push({ type: "user_input", content: String(message || "") });
+  input.push({ type: "user_input", content: clip(message) });
 
   const url = "https://generativelanguage.googleapis.com/v1beta/interactions";
   const ctrl = new AbortController();
@@ -130,10 +131,16 @@ async function askGemini({ message, history }) {
 }
 
 async function writeBloomreach({ email, customer_id, attributes }) {
-  // keep only non-empty string attributes
+  // Model output is untrusted: allowlist keys, cap length, reject markup/template/url/control chars.
+  const ALLOWED_ATTRS = { favorite_color: 60, preferred_location: 80, style_preference: 60, budget_band: 40 };
   const props = {};
-  for (const [k, v] of Object.entries(attributes || {})) {
-    if (typeof v === "string" && v.trim()) props[k] = v.trim();
+  for (const [k, max] of Object.entries(ALLOWED_ATTRS)) {
+    let v = attributes && attributes[k];
+    if (typeof v !== "string") continue;
+    v = v.trim();
+    if (!v || v.length > max) continue;
+    if (/[<>{}$\u0000-\u001f]/.test(v) || /https?:\/\//i.test(v)) continue;
+    props[k] = v;
   }
   if (!BR_READY || Object.keys(props).length === 0) return { wrote: false, props };
   const ids = {};
