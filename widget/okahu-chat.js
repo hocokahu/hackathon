@@ -103,15 +103,18 @@
       cfg.onSend(text, { addMsg: addMsg, addCards: addCards, addChips: addChips });
       return;
     }
-    if (cfg.endpoint) {
+    var endpoint = cfg.endpoint || "https://mosaic-chat-406265238820.us-east1.run.app/chat"; // default backend; override via window.OKAHU_CHAT.endpoint
+    if (endpoint) {
+      var cust = window.OKAHU_CUSTOMER || {};
+      var shopifyCid = (window.ShopifyAnalytics && ShopifyAnalytics.meta && ShopifyAnalytics.meta.page && ShopifyAnalytics.meta.page.customerId) || null;
       var typing = addMsg("…", "bot");
-      fetch(cfg.endpoint, {
+      fetch(endpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           message: text,
-          email: (window.OKAHU_CUSTOMER && window.OKAHU_CUSTOMER.email) || null,
-          customer_id: (window.OKAHU_CUSTOMER && window.OKAHU_CUSTOMER.id) || null,
+          email: cust.email || null,
+          customer_id: cust.id || shopifyCid || null,
           history: history.slice(-10)
         })
       }).then(function (r) { return r.json(); }).then(function (d) {

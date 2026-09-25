@@ -18,12 +18,18 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.8-flash";
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "https://okahu-hackathon.myshopify.com"; // no wildcard default
 
-// Bloomreach Engagement REST (all optional — if unset, attribute writes are skipped, chat still works)
-const BR_API_BASE = (process.env.BLOOMREACH_API_BASE || "").replace(/\/+$/, ""); // e.g. https://api.eu1.exponea.com
+// Bloomreach Engagement tracking Batch API (optional — if unset, attribute writes are skipped, chat still works).
+// Auth = project Public API group Token; hard identifier = email_id (NOT registered — a wrong id is silently dropped).
+const BR_API_BASE = (process.env.BLOOMREACH_API_BASE_URL || "").replace(/\/+$/, ""); // https://api-engagement.bloomreach.com
 const BR_PROJECT_TOKEN = process.env.BLOOMREACH_PROJECT_TOKEN || "";
-const BR_API_KEY_ID = process.env.BLOOMREACH_API_KEY_ID || "";
-const BR_API_SECRET = process.env.BLOOMREACH_API_SECRET || "";
-const BR_READY = BR_API_BASE && BR_PROJECT_TOKEN && BR_API_KEY_ID && BR_API_SECRET;
+const BR_API_TOKEN = process.env.BLOOMREACH_API_TOKEN || "";
+const BR_READY = Boolean(BR_API_BASE && BR_PROJECT_TOKEN && BR_API_TOKEN); // boolean, never expose the token
+
+// Shopify Admin (optional) — resolve a logged-in shopper's email from their storefront customerId, so profile
+// writes work without a theme-side email injection. Uses the read_customers Admin token.
+const SHOP_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN || "";
+const SHOP_TOKEN = process.env.SHOPIFY_ADMIN_API_TOKEN || "";
+const SHOP_VER = process.env.SHOPIFY_API_VERSION || "2025-01";
 
 const SYSTEM_PROMPT = [
   "You are the Team Mosaic Shopping Assistant on an online store.",
@@ -143,21 +149,35 @@ async function writeBloomreach({ email, customer_id, attributes }) {
     props[k] = v;
   }
   if (!BR_READY || Object.keys(props).length === 0) return { wrote: false, props };
-  const ids = {};
-  if (email) ids.registered = email;
-  if (customer_id) ids.shopify_id = String(customer_id);
-  if (Object.keys(ids).length === 0) return { wrote: false, props, reason: "no customer id" };
+  if (!email) return { wrote: false, props, reason: "no email (email_id is the hard identifier)" };
 
-  const auth = "Basic " + Buffer.from(`${BR_API_KEY_ID}:${BR_API_SECRET}`).toString("base64");
-  const url = `${BR_API_BASE}/track/v2/projects/${BR_PROJECT_TOKEN}/customers/properties`;
+  // Tracking Batch API, Public-group Token auth, hard id = email_id. shopify_id added as a soft id when present.
+  const ids = { email_id: email };
+  if (customer_id) ids.shopify_id = String(customer_id);
+  const url = `${BR_API_BASE}/track/v2/projects/${BR_PROJECT_TOKEN}/batch`;
   const resp = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: auth },
-    body: JSON.stringify({ customer_ids: ids, properties: props }),
+    headers: { "Content-Type": "application/json", Authorization: `Token ${BR_API_TOKEN}` },
+    body: JSON.stringify({ commands: [{ name: "customers", data: { customer_ids: ids, properties: props } }] }),
   });
-  const ok = resp.ok;
   const body = await resp.text().catch(() => "");
+  let ok = false;
+  try { const j = JSON.parse(body); ok = !!(j.success && j.results && j.results[0] && j.results[0].success); } catch {}
   return { wrote: ok, props, status: resp.status, detail: ok ? undefined : body.slice(0, 300) };
+}
+
+// Resolve a shopper's email from their Shopify storefront customerId (read_customers). Returns null if unavailable.
+async function resolveEmail(customerId) {
+  if (!SHOP_DOMAIN || !SHOP_TOKEN || !customerId) return null;
+  if (!/^\d+$/.test(String(customerId))) return null; // storefront customerId is numeric
+  try {
+    const r = await fetch(`https://${SHOP_DOMAIN}/admin/api/${SHOP_VER}/customers/${customerId}.json`, {
+      headers: { "X-Shopify-Access-Token": SHOP_TOKEN },
+    });
+    if (!r.ok) return null;
+    const d = await r.json();
+    return (d && d.customer && d.customer.email) || null;
+  } catch { return null; }
 }
 
 const server = http.createServer(async (req, res) => {
@@ -172,9 +192,13 @@ const server = http.createServer(async (req, res) => {
 
     const { reply, attributes } = await askGemini({ message, history });
 
+    // Identity: prefer an email supplied by the theme; otherwise resolve it from the Shopify customerId.
+    let idEmail = typeof email === "string" && email ? email : null;
+    if (!idEmail && customer_id) { try { idEmail = await resolveEmail(customer_id); } catch {} }
+
     let wrote = { wrote: false };
-    if (email || customer_id) {
-      try { wrote = await writeBloomreach({ email, customer_id, attributes }); }
+    if (idEmail) {
+      try { wrote = await writeBloomreach({ email: idEmail, customer_id, attributes }); }
       catch (e) { wrote = { wrote: false, error: String(e).slice(0, 200) }; }
     }
     return json(res, 200, { reply, extracted: attributes, ...wrote });
