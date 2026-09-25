@@ -2,13 +2,8 @@
 
 Track **T6 — Composable commerce orchestration (Advanced)**. All four partner
 platforms (Bloomreach, Google, Shopify, Databricks) must be load-bearing.
-Full strategy notes: [`bloomreach_hackathon.md`](./bloomreach_hackathon.md).
 Build window: 21 Sep → 28 Sep 2026 (midnight PT). Deliverables: ≤5-min demo
 video, GitHub repo + README, written brief.
-
-> **Credentials live in `.env` (gitignored).** This README holds only
-> non-secret identifiers + findings. Copy the template to start:
-> `cp .env.example .env`.
 
 ---
 
@@ -160,9 +155,8 @@ flowchart TB
 
 ## 4. Shopify
 
-- **Account/org:** `owner@example.com` → Partner org **`5206397`** ("Okahu"), dedicated to the hackathon. (This machine may also have other, non-hackathon Shopify accounts/stores — don't assume, always check; see CLAUDE.md.)
+- **Account/org:** `owner@example.com` → Partner org **`5206397`** ("Okahu"), dedicated to the hackathon.
 - **Dev store:** **`okahu-hackathon.myshopify.com`** — Shopify **Plus** development store, **demo data enabled** (products/customers/orders, Bogus payment gateway). Admin: `https://admin.shopify.com/store/okahu-hackathon`. Free (dev store, no charge).
-- Created via the **Dev Dashboard (browser)**, not the CLI — the global Shopify CLI is signed into a different, non-hackathon account and was left untouched.
 
 ### Shopify MCP — configured ✅
 - **`shopify-dev`** (AI toolkit) — `npx -y @shopify/dev-mcp@latest`, no auth. Tools verified: `learn_shopify_api`, `search_docs_chunks`, `validate_graphql_codeblocks`, `validate_theme`, … (docs + GraphQL schema + validation).
@@ -178,38 +172,3 @@ Verified live against `https://okahu-hackathon.myshopify.com/admin/api/2025-01/�
 - `products/count` → **17**, `customers/count` → **3**, `orders/count` → 0 (demo data seeds products + customers, no orders)
 
 Call it with header `X-Shopify-Access-Token: $SHOPIFY_ADMIN_API_TOKEN`, or via the AI toolkit (`shopify-plugin:shopify-admin`) and `npx @shopify/cli@latest store execute`.
-
----
-
-## Browser (gstack) — isolated hackathon profile
-
-All three consoles are driven in a dedicated, isolated Chrome-for-Testing profile
-so logins persist across sessions and never mix with your default browser.
-
-```bash
-source .hackathon-browser.env      # sets CHROMIUM_PROFILE=~/.gstack/hackathon-profile
-~/.claude/skills/gstack/browse/dist/browse connect     # opens the headed window
-```
-
-Only the **headed** browser has a persistent profile; plain `browse goto` (headless)
-is ephemeral. Databricks, GCP (student), and Bloomreach sessions are all saved here.
-
----
-
-## Files & security
-
-| File | Tracked? | Purpose |
-|---|---|---|
-| `.env` | **no** (gitignored) | All real credentials + tokens |
-| `.env.example` | yes | Key template for teammates |
-| `.mcp.json` | yes | 5 MCP servers (loomi-connect, shopify-dev, shopify-storefront, databricks-genie, databricks-uc-functions); secrets via `${VAR}` |
-| `.claude/settings.local.json` | **no** (gitignored) | MCP secrets (`DATABRICKS_TOKEN`) — Claude Code reads env from here, not `.env` |
-| `.hackathon-browser.env` | **no** (gitignored) | Points gstack at the isolated profile |
-| `CLAUDE.md` | yes | Agent guide + **do-not-touch** guardrails for the other accounts on this machine |
-| `bloomreach_hackathon.md` | yes | T6 strategy + demo concepts |
-| `README.md` | yes | This file |
-
-`.gitignore` covers macOS junk (`.DS_Store`, `._*`, …) and secrets (`.env*`,
-`*.pem`, `*.key`, `service-account*.json`, `.databrickscfg`, `.gstack/`, …).
-**Never commit `.env`.** The Databricks PAT expires in 14 days; rotate via
-User Settings → Developer → Access tokens.
