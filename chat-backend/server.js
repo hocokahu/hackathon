@@ -163,7 +163,8 @@ async function writeBloomreach({ email, customer_id, attributes }) {
   const body = await resp.text().catch(() => "");
   let ok = false;
   try { const j = JSON.parse(body); ok = !!(j.success && j.results && j.results[0] && j.results[0].success); } catch {}
-  return { wrote: ok, props, status: resp.status, detail: ok ? undefined : body.slice(0, 300) };
+  if (!ok) console.error("bloomreach write failed", resp.status, body.slice(0, 300)); // log server-side only
+  return { wrote: ok, props, status: resp.status }; // never return the upstream body to the client
 }
 
 // Resolve a shopper's email from their Shopify storefront customerId (read_customers). Returns null if unavailable.
@@ -199,11 +200,12 @@ const server = http.createServer(async (req, res) => {
     let wrote = { wrote: false };
     if (idEmail) {
       try { wrote = await writeBloomreach({ email: idEmail, customer_id, attributes }); }
-      catch (e) { wrote = { wrote: false, error: String(e).slice(0, 200) }; }
+      catch (e) { console.error("bloomreach write error", String(e).slice(0, 300)); wrote = { wrote: false }; }
     }
     return json(res, 200, { reply, extracted: attributes, ...wrote });
   } catch (e) {
-    return json(res, 500, { error: "assistant error", detail: String(e).slice(0, 300) });
+    console.error("assistant error", String(e).slice(0, 300));
+    return json(res, 500, { error: "assistant error" });
   }
 });
 
