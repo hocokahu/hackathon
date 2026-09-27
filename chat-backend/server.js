@@ -104,13 +104,15 @@ function readBody(req) {
 // substitute for real auth). Fixed window; lenient by default so it never blocks normal chat.
 const RL_MAX = Number(process.env.RATE_LIMIT_MAX || 60);
 const RL_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS || 60000);
-const rlHits = new Map(); // ip -> { count, reset }
+const RL_MAX_KEYS = Number(process.env.RATE_LIMIT_MAX_KEYS || 10000);
+const rlHits = new Map(); // ip -> { count, reset } (insertion-ordered for oldest-first eviction)
 function rateLimited(ip) {
   const now = Date.now();
   let e = rlHits.get(ip);
-  if (!e || now > e.reset) { e = { count: 0, reset: now + RL_WINDOW_MS }; rlHits.set(ip, e); }
+  if (!e || now > e.reset) { e = { count: 0, reset: now + RL_WINDOW_MS }; rlHits.delete(ip); rlHits.set(ip, e); }
   e.count++;
-  if (rlHits.size > 5000) { for (const [k, v] of rlHits) if (now > v.reset) rlHits.delete(k); } // cheap sweep
+  // Bound memory: evict oldest keys once over capacity, regardless of expiry (spoofed keys can't grow it unbounded).
+  while (rlHits.size > RL_MAX_KEYS) { const oldest = rlHits.keys().next().value; if (oldest === undefined) break; rlHits.delete(oldest); }
   return e.count > RL_MAX;
 }
 
@@ -284,7 +286,10 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "GET") return json(res, 200, { ok: true, model: GEMINI_MODEL, bloomreach: BR_READY, databricks: DBX_READY });
   if (req.method !== "POST") return json(res, 405, { error: "method not allowed" });
 
-  const ip = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim() || req.socket.remoteAddress || "unknown";
+  // Rate-limit key: use the LAST X-Forwarded-For hop (appended by Cloud Run's front end). Earlier XFF
+  // values are client-supplied and spoofable, so never key off XFF[0]. Fall back to the socket address.
+  const xff = String(req.headers["x-forwarded-for"] || "").split(",").map((s) => s.trim()).filter(Boolean);
+  const ip = xff.length ? xff[xff.length - 1] : (req.socket.remoteAddress || "unknown");
   if (rateLimited(ip)) return json(res, 429, { error: "rate limited" });
 
   let body;
