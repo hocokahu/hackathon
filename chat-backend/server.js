@@ -100,6 +100,20 @@ function readBody(req) {
   });
 }
 
+// Lightweight per-IP rate limit (defense-in-depth on a public, unauthenticated endpoint — NOT a
+// substitute for real auth). Fixed window; lenient by default so it never blocks normal chat.
+const RL_MAX = Number(process.env.RATE_LIMIT_MAX || 60);
+const RL_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS || 60000);
+const rlHits = new Map(); // ip -> { count, reset }
+function rateLimited(ip) {
+  const now = Date.now();
+  let e = rlHits.get(ip);
+  if (!e || now > e.reset) { e = { count: 0, reset: now + RL_WINDOW_MS }; rlHits.set(ip, e); }
+  e.count++;
+  if (rlHits.size > 5000) { for (const [k, v] of rlHits) if (now > v.reset) rlHits.delete(k); } // cheap sweep
+  return e.count > RL_MAX;
+}
+
 async function askGemini({ message, history }) {
   // Gemini Interactions API (the replacement for generateContent). Stateless: we pass full history.
   const clip = (s) => String(s == null ? "" : s).slice(0, 2000); // cap per-turn text
@@ -202,18 +216,18 @@ async function writeBloomreach({ email, customer_id, device_id, attributes }) {
 }
 
 // Explicit anonymous→known merge: send ONE command carrying both cookie (device_id) and email_id so
-// Bloomreach stitches the anonymous profile into the known one. Email is resolved SERVER-SIDE from the
-// Shopify customer_id when possible (trusted); a client-supplied email is accepted only as a fallback
-// (spoofable — close the auth gap before trusting it in production).
-async function mergeBloomreach({ device_id, email, customer_id }) {
-  if (!BR_READY) return { merged: false, reason: "bloomreach not configured" };
-  if (!device_id) return { merged: false, reason: "device_id required" };
-  let idEmail = null, source = null;
-  if (customer_id) { try { idEmail = await resolveEmail(customer_id); if (idEmail) source = "shopify"; } catch {} }
-  if (!idEmail && typeof email === "string" && email) { idEmail = email; source = "client"; } // fallback: untrusted
-  if (!idEmail) return { merged: false, reason: "no email (pass a Shopify customer_id or email)" };
-  const { ok, status } = await brTrack(brCustomerIds({ email: idEmail, device_id }), {});
-  return { merged: ok, status, identity_source: source };
+// Bloomreach stitches the anonymous profile into the known one. Identity is TRUSTED ONLY when the email
+// is resolved SERVER-SIDE from the Shopify customer_id — a client-asserted email is never accepted (that
+// would let anyone stitch a device into any email profile). Residual: customer_id is itself client-
+// supplied; the full fix is Shopify App Proxy HMAC (planned auth phase). Responses are uniform to avoid a
+// customer_id enumeration oracle.
+async function mergeBloomreach({ device_id, customer_id }) {
+  if (!BR_READY || !device_id || !customer_id) return { merged: false };
+  let idEmail = null;
+  try { idEmail = await resolveEmail(customer_id); } catch {}
+  if (!idEmail) return { merged: false };
+  const { ok } = await brTrack(brCustomerIds({ email: idEmail, device_id }), {});
+  return { merged: ok };
 }
 
 // Mirror the extracted signal into Databricks (Delta table) so the Databricks agent can reason over it.
@@ -270,29 +284,34 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "GET") return json(res, 200, { ok: true, model: GEMINI_MODEL, bloomreach: BR_READY, databricks: DBX_READY });
   if (req.method !== "POST") return json(res, 405, { error: "method not allowed" });
 
+  const ip = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim() || req.socket.remoteAddress || "unknown";
+  if (rateLimited(ip)) return json(res, 429, { error: "rate limited" });
+
   let body;
   try { body = await readBody(req); }
   catch { return json(res, 400, { error: "invalid request body" }); }
 
   // Anonymous→known merge (Phase 0): stitch a device_id (cookie) into an email_id profile.
+  // Identity is resolved server-side from the Shopify customer_id; uniform response (no enumeration oracle).
   if (path === "/merge") {
     try {
-      const out = await mergeBloomreach({ device_id: body.device_id, email: body.email, customer_id: body.customer_id });
-      return json(res, out.merged ? 200 : 400, out);
-    } catch (e) { console.error("merge error", String(e).slice(0, 300)); return json(res, 500, { error: "merge error" }); }
+      const out = await mergeBloomreach({ device_id: body.device_id, customer_id: body.customer_id });
+      return json(res, 200, out);
+    } catch (e) { console.error("merge error", String(e).slice(0, 300)); return json(res, 500, { error: "server error" }); }
   }
 
   // Chat (default; also serves /chat and /).
   try {
-    const { message, email, customer_id, device_id, history } = body;
+    const { message, customer_id, device_id, history } = body;
     if (!message || !String(message).trim()) return json(res, 400, { error: "message required" });
     if (!GEMINI_API_KEY) return json(res, 500, { error: "server missing GEMINI_API_KEY" });
 
     const { reply, attributes } = await askGemini({ message, history });
 
-    // Identity: prefer a theme-supplied email; else resolve from the Shopify customerId; else stay anonymous (device_id).
-    let idEmail = typeof email === "string" && email ? email : null;
-    if (!idEmail && customer_id) { try { idEmail = await resolveEmail(customer_id); } catch {} }
+    // Identity is derived SERVER-SIDE from the Shopify customer_id — a client-asserted email is NEVER
+    // trusted (spoofable). Logged-in shoppers arrive with a customer_id; anonymous shoppers use device_id.
+    let idEmail = null;
+    if (customer_id) { try { idEmail = await resolveEmail(customer_id); } catch {} }
 
     let wrote = { wrote: false };
     let dbx = { dbx: false };
