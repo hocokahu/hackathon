@@ -41,6 +41,11 @@ const SHOP_VER = process.env.SHOPIFY_API_VERSION || "2025-01";
 const APP_PROXY_SECRET = process.env.SHOPIFY_APP_PROXY_SECRET || "";
 const REQUIRE_APP_PROXY = String(process.env.REQUIRE_APP_PROXY || "").toLowerCase() === "true";
 
+// Shared secret for the internal enrichment routes (/enrich, /agent/run). Fail closed: if unset, those
+// routes are disabled (401). Callers pass `Authorization: Bearer <key>` or `x-enrich-key: <key>`.
+const ENRICH_API_KEY = process.env.ENRICH_API_KEY || "";
+const EMAIL_RE = /^[^\s@]{1,254}@[^\s@]+\.[^\s@]+$/;
+
 // Verify a Shopify App Proxy request. Returns { valid, logged_in_customer_id }. Signature algorithm:
 // take all query params except `signature`, sort by key, join as key=value with NO separator (array
 // values joined by comma), HMAC-SHA256 with the app secret, hex-compare (timing-safe) to `signature`.
@@ -328,7 +333,7 @@ async function dbxExec(statement) {
     return { ok, rows, cols };
   } catch (e) { console.error("dbx exec error", String(e).slice(0, 200)); return { ok: false, rows: [], cols: [] }; }
 }
-const sqlLit = (v) => (v == null ? "NULL" : `'${String(v).replace(/'/g, "''").slice(0, 800)}'`);
+const sqlLit = (v) => (v == null ? "NULL" : `'${String(v).replace(/\\/g, "\\\\").replace(/'/g, "''").slice(0, 800)}'`);
 const sqlNum = (v) => (typeof v === "number" && isFinite(v) ? String(v) : "NULL");
 const sqlBool = (v) => (v === true ? "true" : v === false ? "false" : "NULL");
 
@@ -427,7 +432,7 @@ function activationProps({ rec, weather }) {
 
 // Orchestrate: resolve location → weather (+store) → reason → write recommendation (+ activate Bloomreach).
 async function enrich({ email, device_id, location }) {
-  if (!email) return { ok: false, reason: "email required for enrichment" };
+  if (!email || !EMAIL_RE.test(email)) return { ok: false, reason: "valid identity required" };
   const context = await getCustomerContext(email);
   const loc = (typeof location === "string" && location.trim()) || context.favorite_location || context.preferred_location || null;
   if (!loc) return { ok: false, reason: "no location (pass location, or set favorite_location via chat first)" };
@@ -447,7 +452,7 @@ async function enrich({ email, device_id, location }) {
   }
 
   const rec = await reason({ email, context, weather });
-  if (!rec || !rec.recommended_product) return { ok: false, reason: "reasoning failed", weather, context };
+  if (!rec || !rec.recommended_product) return { ok: false, reason: "reasoning failed" };
 
   // store the recommendation
   const ownsSnowboard = context.favorite_activity && /snowboard/i.test(context.favorite_activity) ? true : null;
@@ -507,11 +512,17 @@ const server = http.createServer(async (req, res) => {
   // reads it from the shopper's stored context. Internal/agent route — in production put it behind auth.
   // Identity: trusted customer id (proxy) → resolve email; else customer_id → resolve; else a direct email.
   if (path === "/enrich" || path === "/agent/run") {
+    // Internal/agent route — require the shared secret (fail closed) OR a verified app-proxy request.
+    const provided = String(req.headers["authorization"] || "").replace(/^Bearer\s+/i, "") || String(req.headers["x-enrich-key"] || "");
+    const keyOk = !!ENRICH_API_KEY && provided.length === ENRICH_API_KEY.length &&
+      crypto.timingSafeEqual(Buffer.from(provided), Buffer.from(ENRICH_API_KEY));
+    if (!keyOk && !proxy.valid) return json(res, 401, { error: "unauthorized" });
     try {
+      // Identity: verified proxy id first; a trusted caller (has the key) may also name the customer/email.
       let email = null;
       if (trustedCustomerId) { try { email = await resolveEmail(trustedCustomerId); } catch {} }
-      if (!email && body.customer_id) { try { email = await resolveEmail(body.customer_id); } catch {} }
-      if (!email && typeof body.email === "string" && body.email) email = body.email;
+      if (!email && keyOk && body.customer_id) { try { email = await resolveEmail(body.customer_id); } catch {} }
+      if (!email && keyOk && typeof body.email === "string" && body.email) email = body.email;
       const out = await enrich({ email, device_id: body.device_id, location: body.location });
       return json(res, out.ok ? 200 : 400, out);
     } catch (e) { console.error("enrich error", String(e).slice(0, 300)); return json(res, 500, { error: "enrich error" }); }
