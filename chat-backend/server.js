@@ -17,6 +17,9 @@ const crypto = require("node:crypto");
 const PORT = process.env.PORT || 8080;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.8-flash";
+// Image generation (the "image OUTPUT" leg). Gemini 3 Pro Image (Nano Banana Pro) accepts text and,
+// optionally, an input image (image IN → image OUT), and returns inline JPEG/PNG bytes.
+const GEMINI_IMAGE_MODEL = process.env.GEMINI_IMAGE_MODEL || "gemini-3-pro-image-preview";
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "https://okahu-hackathon.myshopify.com"; // no wildcard default
 
 // Bloomreach Engagement tracking Batch API (optional — if unset, attribute writes are skipped, chat still works).
@@ -40,6 +43,12 @@ const SHOP_VER = process.env.SHOPIFY_API_VERSION || "2025-01";
 // (identity accepted only from a verified proxy request); false keeps the pre-proxy behavior during rollout.
 const APP_PROXY_SECRET = process.env.SHOPIFY_APP_PROXY_SECRET || "";
 const REQUIRE_APP_PROXY = String(process.env.REQUIRE_APP_PROXY || "").toLowerCase() === "true";
+
+// Public storefront vision (POST /vision-chat): lets an anonymous shopper (real device_id) or a
+// verified app-proxy shopper upload a photo and get a visual recommendation. It runs vision + image
+// generation, so it is behind a feature flag and its OWN stricter rate limit. Never trusts a
+// client-asserted email — anonymous writes go to the cookie profile only. Default OFF.
+const PUBLIC_VISION = String(process.env.PUBLIC_VISION || "").toLowerCase() === "true";
 
 // Shared secret for the internal enrichment routes (/enrich, /agent/run). Fail closed: if unset, those
 // routes are disabled (401). Callers pass `Authorization: Bearer <key>` or `x-enrich-key: <key>`.
@@ -71,6 +80,14 @@ const DBX_TOKEN = process.env.DATABRICKS_TOKEN || "";
 const DBX_WAREHOUSE = process.env.DATABRICKS_WAREHOUSE_ID || "";
 const DBX_SIGNALS_TABLE = process.env.DATABRICKS_SIGNALS_TABLE || "workspace.default.mosaic_chat_signals";
 const DBX_READY = Boolean(DBX_HOST && DBX_TOKEN && DBX_WAREHOUSE);
+// The Databricks-hosted brain the service calls for VISION reasoning. This is a real Databricks Model
+// Serving endpoint (Claude Sonnet 4.5) invoked over the OpenAI-compatible /invocations API — the same
+// governed endpoint a deployed Mosaic AI Agent would front. It receives the image inline (data URI) in
+// the request body; Databricks never dials out (all egress stays in Cloud Run). See databricks/agent.py
+// for the committable Agent Framework version (Claude + UC tools + Genie) that productionizes this call.
+const DBX_VISION_ENDPOINT = process.env.DATABRICKS_VISION_ENDPOINT || "databricks-claude-sonnet-4-5";
+const DBX_VISION_TABLE = process.env.DATABRICKS_VISION_TABLE || "workspace.default.mosaic_vision_reco";
+const VISION_READY = Boolean(DBX_READY && GEMINI_API_KEY);
 
 const SYSTEM_PROMPT = [
   "You are the Team Mosaic Shopping Assistant on an online store.",
@@ -117,12 +134,14 @@ function json(res, code, obj) {
   res.end(JSON.stringify(obj));
 }
 
+// Body cap: chat payloads are tiny, but /vision-enrich carries a base64 image, so allow up to ~10 MB.
+const MAX_BODY_BYTES = Number(process.env.MAX_BODY_BYTES || 10 * 1024 * 1024);
 function readBody(req) {
   return new Promise((resolve, reject) => {
     let data = "";
     req.on("data", (c) => {
       data += c;
-      if (data.length > 1e6) { reject(new Error("payload too large")); req.destroy(); }
+      if (data.length > MAX_BODY_BYTES) { reject(new Error("payload too large")); req.destroy(); }
     });
     req.on("end", () => {
       try { resolve(data ? JSON.parse(data) : {}); }
@@ -146,6 +165,18 @@ function rateLimited(ip) {
   // Bound memory: evict oldest keys once over capacity, regardless of expiry (spoofed keys can't grow it unbounded).
   while (rlHits.size > RL_MAX_KEYS) { const oldest = rlHits.keys().next().value; if (oldest === undefined) break; rlHits.delete(oldest); }
   return e.count > RL_MAX;
+}
+
+// Separate, much stricter limiter for the public vision route (each call runs vision + image-gen).
+const VISION_RL_MAX = Number(process.env.VISION_RATE_LIMIT_MAX || 6);
+const vrlHits = new Map();
+function visionRateLimited(ip) {
+  const now = Date.now();
+  let e = vrlHits.get(ip);
+  if (!e || now > e.reset) { e = { count: 0, reset: now + RL_WINDOW_MS }; vrlHits.delete(ip); vrlHits.set(ip, e); }
+  e.count++;
+  while (vrlHits.size > RL_MAX_KEYS) { const oldest = vrlHits.keys().next().value; if (oldest === undefined) break; vrlHits.delete(oldest); }
+  return e.count > VISION_RL_MAX;
 }
 
 async function askGemini({ message, history }) {
@@ -430,6 +461,21 @@ function activationProps({ rec, weather }) {
   return props;
 }
 
+// Resolve a location name → 7-day weather (Cloud Run egress) and persist it to mosaic_weather so the
+// Databricks agent's get_weather_forecast tool can read it. Returns the weather object or null.
+async function getWeatherForLocation(loc) {
+  const geo = await geocodeLocation(loc);
+  if (!geo) return null;
+  const fc = await fetchForecast(geo.lat, geo.lon);
+  if (!fc) return null;
+  const weather = { location: geo.name, lat: geo.lat, lon: geo.lon, ...fc };
+  await dbxExec(
+    `INSERT INTO workspace.default.mosaic_weather (location,lat,lon,week_start,temp_high_f,temp_low_f,precip_prob_max,summary,forecast_json,fetched_at) VALUES (` +
+    `${sqlLit(weather.location)},${sqlNum(weather.lat)},${sqlNum(weather.lon)},${sqlLit(weather.week_start)},${sqlNum(weather.temp_high_f)},${sqlNum(weather.temp_low_f)},${sqlNum(weather.precip_prob_max)},${sqlLit(weather.summary)},${sqlLit(weather.forecast_json)},current_timestamp())`
+  );
+  return weather;
+}
+
 // Orchestrate: resolve location → weather (+store) → reason → write recommendation (+ activate Bloomreach).
 async function enrich({ email, device_id, location }) {
   if (!email || !EMAIL_RE.test(email)) return { ok: false, reason: "valid identity required" };
@@ -437,19 +483,7 @@ async function enrich({ email, device_id, location }) {
   const loc = (typeof location === "string" && location.trim()) || context.favorite_location || context.preferred_location || null;
   if (!loc) return { ok: false, reason: "no location (pass location, or set favorite_location via chat first)" };
 
-  let weather = null;
-  const geo = await geocodeLocation(loc);
-  if (geo) {
-    const fc = await fetchForecast(geo.lat, geo.lon);
-    if (fc) {
-      weather = { location: geo.name, lat: geo.lat, lon: geo.lon, ...fc };
-      // store in mosaic_weather
-      await dbxExec(
-        `INSERT INTO workspace.default.mosaic_weather (location,lat,lon,week_start,temp_high_f,temp_low_f,precip_prob_max,summary,forecast_json,fetched_at) VALUES (` +
-        `${sqlLit(weather.location)},${sqlNum(weather.lat)},${sqlNum(weather.lon)},${sqlLit(weather.week_start)},${sqlNum(weather.temp_high_f)},${sqlNum(weather.temp_low_f)},${sqlNum(weather.precip_prob_max)},${sqlLit(weather.summary)},${sqlLit(weather.forecast_json)},current_timestamp())`
-      );
-    }
-  }
+  const weather = await getWeatherForLocation(loc);
 
   const rec = await reason({ email, context, weather });
   if (!rec || !rec.recommended_product) return { ok: false, reason: "reasoning failed" };
@@ -472,11 +506,212 @@ async function enrich({ email, device_id, location }) {
   return { ok: true, location: loc, weather, recommendation: rec, activated };
 }
 
+// ── Phase 2: multimodal "Vision Stylist" leg ─────────────────────────────────────────────────────
+// Image IN → Databricks Claude (vision) analysis grounded in cross-platform context + live weather →
+// real product resolution (Shopify) → generated lifestyle image OUT (Gemini). This is the leg that does
+// what Bloomreach's behavioral engine cannot: reason over the shopper's OWN photo.
+
+const MAX_IMAGE_BYTES = Number(process.env.MAX_IMAGE_BYTES || 7 * 1024 * 1024);
+const IMG_MIME_OK = new Set(["image/png", "image/jpeg", "image/webp"]);
+
+// Parse a client-supplied image into { mime, b64, dataUri } or null. Accepts a data: URI or raw base64.
+// Rejects oversize / non-image payloads (untrusted input).
+function parseImage(input, mimeHint) {
+  if (typeof input !== "string" || !input) return null;
+  let mime = mimeHint || "image/jpeg", b64 = input.trim();
+  const m = b64.match(/^data:([^;]+);base64,(.*)$/s);
+  if (m) { mime = m[1]; b64 = m[2]; }
+  b64 = b64.replace(/\s+/g, "");
+  if (!/^[A-Za-z0-9+/=]+$/.test(b64) || b64.length < 100) return null;
+  if (!IMG_MIME_OK.has(mime)) mime = "image/jpeg";
+  if (Math.floor((b64.length * 3) / 4) > MAX_IMAGE_BYTES) return null;
+  return { mime, b64, dataUri: `data:${mime};base64,${b64}` };
+}
+
+// Cache the Shopify catalog briefly so product resolution doesn't refetch on every call.
+let _catalog = { at: 0, items: [] };
+async function getCatalog() {
+  if (!SHOP_DOMAIN || !SHOP_TOKEN) return [];
+  if (Date.now() - _catalog.at < 300000 && _catalog.items.length) return _catalog.items;
+  try {
+    const r = await fetch(`https://${SHOP_DOMAIN}/admin/api/${SHOP_VER}/products.json?limit=250&fields=id,title,handle,product_type,image,variants`, {
+      headers: { "X-Shopify-Access-Token": SHOP_TOKEN },
+    });
+    if (!r.ok) return _catalog.items;
+    const d = await r.json();
+    const items = (d.products || []).filter((p) => (p.product_type || "").toLowerCase() !== "giftcard").map((p) => ({
+      id: p.id, title: p.title, handle: p.handle, product_type: p.product_type,
+      price: ((p.variants || [])[0] || {}).price || null,
+      image: (p.image || {}).src || null,
+      url: `https://${SHOP_DOMAIN}/products/${p.handle}`,
+    }));
+    if (items.length) _catalog = { at: Date.now(), items };
+    return _catalog.items;
+  } catch { return _catalog.items; }
+}
+
+// Match an LLM-named product to a real catalog item (exact title, else best token overlap).
+function matchProduct(name, catalog) {
+  if (!name) return null;
+  const norm = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9 ]/g, " ").split(/\s+/).filter(Boolean);
+  const exact = catalog.find((p) => p.title.toLowerCase() === String(name).toLowerCase());
+  if (exact) return exact;
+  const target = norm(name);
+  let best = null, bestScore = 0;
+  for (const p of catalog) {
+    const set = new Set(norm(p.title));
+    const score = target.reduce((n, t) => n + (set.has(t) ? 1 : 0), 0);
+    if (score > bestScore) { bestScore = score; best = p; }
+  }
+  return bestScore > 0 ? best : null;
+}
+
+// Call the Databricks-hosted Claude (vision) with the shopper's image + cross-platform context + weather.
+// Returns structured JSON. All egress stays in Cloud Run; the image travels inline in the request body.
+async function analyzeImageWithClaude({ imageDataUri, context, weather, catalog }) {
+  const ctxLine = Object.entries(context || {}).map(([k, v]) => `${k}=${v}`).join(", ") || "no stated preferences yet";
+  const w = weather ? `Live 7-day forecast for ${weather.location}: ${weather.summary}.` : "Weather unknown.";
+  const menu = catalog.map((p) => `- ${p.title}${p.price ? ` ($${p.price})` : ""}`).join("\n");
+  const sys = [
+    "You are Mosaic's visual merchandising analyst for an outdoor & snowboard store.",
+    "You are given a SHOPPER'S OWN PHOTO plus their cross-platform profile and the live weather forecast.",
+    "Study the photo for signals a behavioral engine cannot see: the setting/terrain, the season, the",
+    "gear they already own and its apparent condition/suitability, their activity, and weather cues.",
+    "Then recommend the single best next product to cross-sell FROM THE CATALOG BELOW (use the exact title).",
+  ].join(" ");
+  const userText = [
+    `Shopper profile: ${ctxLine}.`, w, "", "CATALOG (choose exactly one title):", menu, "",
+    'Return ONLY compact JSON, no prose: {"visual_analysis":"<2-3 sentences on what the photo reveals and why it matters>","recommended_product":"<exact catalog title>","propensity":<0-1>,"rationale":"<one sentence that explicitly references what you saw in the photo>","lifestyle_image_prompt":"<a vivid prompt to generate a lifestyle photo of the recommended product in a scene matching this shopper>"}',
+  ].join("\n");
+  const payload = {
+    messages: [
+      { role: "system", content: sys },
+      { role: "user", content: [
+        { type: "text", text: userText },
+        { type: "image_url", image_url: { url: imageDataUri } },
+      ] },
+    ],
+    max_tokens: 700, temperature: 0.2,
+  };
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 60000);
+  let resp;
+  try {
+    resp = await fetch(`${DBX_HOST}/serving-endpoints/${DBX_VISION_ENDPOINT}/invocations`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${DBX_TOKEN}` },
+      signal: ctrl.signal, body: JSON.stringify(payload),
+    });
+  } catch (e) { clearTimeout(t); console.error("vision call error", String(e).slice(0, 200)); return null; }
+  clearTimeout(t);
+  if (!resp.ok) { console.error("vision http", resp.status, (await resp.text().catch(() => "")).slice(0, 200)); return null; }
+  const data = await resp.json().catch(() => ({}));
+  let text = "";
+  const c = ((data.choices || [])[0] || {}).message;
+  if (c) text = Array.isArray(c.content) ? c.content.map((p) => p.text || "").join("") : String(c.content || "");
+  const mm = text.match(/\{[\s\S]*\}/);
+  if (mm) text = mm[0];
+  try {
+    const p = JSON.parse(text);
+    const prop = Number(p.propensity);
+    return {
+      visual_analysis: typeof p.visual_analysis === "string" ? p.visual_analysis.slice(0, 600) : null,
+      recommended_product: typeof p.recommended_product === "string" ? p.recommended_product.slice(0, 90) : null,
+      propensity: isFinite(prop) ? Math.max(0, Math.min(1, Math.round(prop * 100) / 100)) : null,
+      rationale: typeof p.rationale === "string" ? p.rationale.slice(0, 400) : null,
+      lifestyle_image_prompt: typeof p.lifestyle_image_prompt === "string" ? p.lifestyle_image_prompt.slice(0, 600) : null,
+    };
+  } catch { return null; }
+}
+
+// Generate a lifestyle image (image OUTPUT). Optionally conditioned on the shopper's photo (image IN →
+// image OUT). Returns a data URI or null. Cloud Run egress → Gemini image model.
+async function generateLifestyleImage({ prompt, inputImageDataUri }) {
+  if (!GEMINI_API_KEY || !prompt) return null;
+  const parts = [{ text: `${prompt}\nPhotorealistic, editorial product-lifestyle photography. No text, no logos, no watermark.` }];
+  if (inputImageDataUri) {
+    const m = inputImageDataUri.match(/^data:([^;]+);base64,(.*)$/s);
+    if (m) parts.push({ inlineData: { mimeType: m[1], data: m[2] } });
+  }
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 90000);
+  let resp;
+  try {
+    resp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_IMAGE_MODEL}:generateContent`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY },
+      signal: ctrl.signal, body: JSON.stringify({ contents: [{ parts }] }),
+    });
+  } catch (e) { clearTimeout(t); console.error("image gen error", String(e).slice(0, 200)); return null; }
+  clearTimeout(t);
+  if (!resp.ok) { console.error("image gen http", resp.status); return null; }
+  const d = await resp.json().catch(() => ({}));
+  for (const cand of d.candidates || []) {
+    for (const p of ((cand.content || {}).parts) || []) {
+      const inl = p.inlineData || p.inline_data;
+      if (inl && inl.data) return `data:${inl.mimeType || inl.mime_type || "image/jpeg"};base64,${inl.data}`;
+    }
+  }
+  return null;
+}
+
+// Orchestrate the multimodal leg: image → Claude vision analysis → product resolve → lifestyle image →
+// persist (mosaic_vision_reco) + activate Bloomreach. `email` may be null (anonymous device_id path).
+async function visionEnrich({ email, device_id, image, location, generateImage = true }) {
+  if (!VISION_READY) return { ok: false, reason: "vision not configured" };
+  if (!email && !device_id) return { ok: false, reason: "identity required (email via server-resolved id, or device_id)" };
+  if (email && !EMAIL_RE.test(email)) return { ok: false, reason: "invalid identity" };
+  const img = parseImage(image && image.data, image && image.mime);
+  if (!img) return { ok: false, reason: "a valid image is required (png/jpeg/webp, <=7MB)" };
+
+  const context = email ? await getCustomerContext(email) : {};
+  const loc = (typeof location === "string" && location.trim()) || context.favorite_location || context.preferred_location || null;
+  const weather = loc ? await getWeatherForLocation(loc) : null;
+  const catalog = await getCatalog();
+  if (!catalog.length) return { ok: false, reason: "catalog unavailable" };
+
+  const analysis = await analyzeImageWithClaude({ imageDataUri: img.dataUri, context, weather, catalog });
+  if (!analysis || !analysis.recommended_product) return { ok: false, reason: "vision analysis failed" };
+  const product = matchProduct(analysis.recommended_product, catalog);
+
+  let lifestyle = null;
+  if (generateImage && analysis.lifestyle_image_prompt) {
+    const p = `${analysis.lifestyle_image_prompt} Featured product: ${(product && product.title) || analysis.recommended_product}.`;
+    lifestyle = await generateLifestyleImage({ prompt: p, inputImageDataUri: img.dataUri });
+  }
+
+  // Persist to Databricks (keyed on email when known, else device_id).
+  await dbxExec(
+    `INSERT INTO ${DBX_VISION_TABLE} (email,device_id,visual_analysis,recommended_product,matched_sku,matched_product,propensity,rationale,weather_summary,image_generated,model,created_at) VALUES (` +
+    `${sqlLit(email)},${sqlLit(device_id)},${sqlLit(analysis.visual_analysis)},${sqlLit(analysis.recommended_product)},${sqlLit(product && String(product.id))},${sqlLit(product && product.title)},${sqlNum(analysis.propensity)},${sqlLit(analysis.rationale)},${sqlLit(weather && weather.summary)},${sqlBool(!!lifestyle)},${sqlLit(DBX_VISION_ENDPOINT + " (vision, Databricks Model Serving)")},current_timestamp())`
+  );
+
+  // Activate onto the Bloomreach profile (attrs allowlisted/validated — LLM output is untrusted).
+  let activated = false;
+  if (BR_READY && (email || device_id)) {
+    const rec = { recommended_product: (product && product.title) || analysis.recommended_product, propensity: analysis.propensity, rationale: analysis.rationale };
+    const props = activationProps({ rec, weather });
+    const va = typeof analysis.visual_analysis === "string" ? analysis.visual_analysis.trim().slice(0, 250) : "";
+    if (va && !/[<>{}$\u0000-\u001f]/.test(va)) props.vision_analysis = va;
+    props.recommendation_source = "mosaic-vision-agent";
+    const ids = brCustomerIds({ email, device_id });
+    const { ok } = await brTrack(ids, props);
+    activated = ok;
+  }
+
+  return {
+    ok: true, identity: email ? "email_id" : "cookie", location: loc, weather,
+    analysis, product,
+    recommendation: { product: (product && product.title) || analysis.recommended_product, price: product && product.price, image: product && product.image, url: product && product.url, propensity: analysis.propensity, rationale: analysis.rationale },
+    lifestyle_image: lifestyle, activated,
+  };
+}
+
 const server = http.createServer(async (req, res) => {
   if (req.method === "OPTIONS") { cors(res); res.writeHead(204); return res.end(); }
   const u = new URL(req.url || "/", "http://localhost");
   const path = u.pathname.replace(/\/+$/, "") || "/";
-  if (req.method === "GET") return json(res, 200, { ok: true, model: GEMINI_MODEL, bloomreach: BR_READY, databricks: DBX_READY, app_proxy: Boolean(APP_PROXY_SECRET), require_app_proxy: REQUIRE_APP_PROXY });
+  if (req.method === "GET") return json(res, 200, { ok: true, model: GEMINI_MODEL, image_model: GEMINI_IMAGE_MODEL, bloomreach: BR_READY, databricks: DBX_READY, vision: VISION_READY, vision_endpoint: DBX_VISION_ENDPOINT, public_vision: PUBLIC_VISION, app_proxy: Boolean(APP_PROXY_SECRET), require_app_proxy: REQUIRE_APP_PROXY });
   if (req.method !== "POST") return json(res, 405, { error: "method not allowed" });
 
   // Verify the Shopify App Proxy signature (present when the request came through /apps/<subpath>/*).
@@ -526,6 +761,43 @@ const server = http.createServer(async (req, res) => {
       const out = await enrich({ email, device_id: body.device_id, location: body.location });
       return json(res, out.ok ? 200 : 400, out);
     } catch (e) { console.error("enrich error", String(e).slice(0, 300)); return json(res, 500, { error: "enrich error" }); }
+  }
+
+  // Vision enrichment (Phase 2): image IN → Databricks Claude vision analysis → real product → lifestyle
+  // image OUT → Databricks + Bloomreach activation. Same auth as /enrich (shared key OR verified app
+  // proxy — fail closed). Identity resolved server-side; a client-asserted email is only honored for a
+  // trusted key-holder (batch/proof), never from the public path.
+  if (path === "/vision-enrich") {
+    const provided = String(req.headers["authorization"] || "").replace(/^Bearer\s+/i, "") || String(req.headers["x-enrich-key"] || "");
+    const keyOk = !!ENRICH_API_KEY && provided.length === ENRICH_API_KEY.length &&
+      crypto.timingSafeEqual(Buffer.from(provided), Buffer.from(ENRICH_API_KEY));
+    if (!keyOk && !proxy.valid) return json(res, 401, { error: "unauthorized" });
+    try {
+      let email = null;
+      if (trustedCustomerId) { try { email = await resolveEmail(trustedCustomerId); } catch {} }
+      if (!email && keyOk && body.customer_id) { try { email = await resolveEmail(body.customer_id); } catch {} }
+      if (!email && keyOk && typeof body.email === "string" && body.email) email = body.email;
+      const image = typeof body.image === "string" ? { data: body.image } : body.image;
+      const out = await visionEnrich({ email, device_id: body.device_id, image, location: body.location, generateImage: body.generate_image !== false });
+      return json(res, out.ok ? 200 : 400, out);
+    } catch (e) { console.error("vision-enrich error", String(e).slice(0, 300)); return json(res, 500, { error: "vision error" }); }
+  }
+
+  // Public storefront vision (Phase 2): a shopper uploads a photo from the chat widget. Anonymous
+  // shoppers are identified by their device_id (cookie profile); a verified app proxy yields a known
+  // profile. Feature-flagged (PUBLIC_VISION) + its own strict rate limit. A client-asserted email is
+  // NEVER trusted here — only server-resolved (proxy) identity or the anonymous device_id.
+  if (path === "/vision-chat") {
+    if (!PUBLIC_VISION && !proxy.valid) return json(res, 401, { error: "unauthorized" });
+    if (visionRateLimited(ip)) return json(res, 429, { error: "rate limited" });
+    try {
+      let email = null;
+      if (trustedCustomerId) { try { email = await resolveEmail(trustedCustomerId); } catch {} }
+      if (!email && !body.device_id) return json(res, 400, { error: "device_id required" });
+      const image = typeof body.image === "string" ? { data: body.image } : body.image;
+      const out = await visionEnrich({ email, device_id: body.device_id, image, location: body.location, generateImage: body.generate_image !== false });
+      return json(res, out.ok ? 200 : 400, out);
+    } catch (e) { console.error("vision-chat error", String(e).slice(0, 300)); return json(res, 500, { error: "vision error" }); }
   }
 
   // Chat (default; also serves /chat and /).

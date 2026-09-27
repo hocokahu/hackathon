@@ -47,7 +47,24 @@
   .okc-foot input{flex:1;border:1px solid #CBD5E1;border-radius:10px;padding:10px 12px;font-size:14px;outline:none}
   .okc-foot input:focus{border-color:${BRAND.accent}}
   .okc-send{background:${BRAND.accent};color:#fff;border:none;border-radius:10px;padding:0 14px;cursor:pointer;font-size:14px}
+  .okc-photo{background:#fff;border:1px solid #CBD5E1;color:${BRAND.ink};border-radius:10px;width:42px;
+    cursor:pointer;font-size:18px;display:flex;align-items:center;justify-content:center}
+  .okc-photo:hover{border-color:${BRAND.accent}}
   .okc-tag{font-size:10px;color:#94A3B8;text-align:center;padding:0 0 8px;background:#fff}
+  .okc-uimg{max-width:82%;border-radius:14px;margin:0 0 10px auto;display:block;border:2px solid ${BRAND.accent}}
+  .okc-vcard{background:#fff;border:1px solid #E2E8F0;border-radius:14px;overflow:hidden;margin-bottom:10px}
+  .okc-vcard .okc-gen{position:relative}
+  .okc-vcard .okc-gen img{width:100%;display:block;background:#Eef2f6}
+  .okc-vcard .okc-genlbl{position:absolute;top:8px;left:8px;background:rgba(15,23,42,.82);color:#fff;
+    font-size:10px;font-weight:700;letter-spacing:.05em;padding:3px 8px;border-radius:6px}
+  .okc-vbody{padding:11px 13px}
+  .okc-vbody .okc-vname{font-size:15px;font-weight:700;color:${BRAND.ink}}
+  .okc-vbody .okc-vprice{font-size:14px;font-weight:700;color:${BRAND.accentDark};margin-top:1px}
+  .okc-vbody .okc-vwhy{font-size:12.5px;color:#475569;margin:6px 0 0;line-height:1.4}
+  .okc-vbody .okc-vprop{display:inline-block;font-size:11px;font-weight:700;color:${BRAND.accentDark};
+    background:#E6FffB;border:1px solid #99F6E4;border-radius:999px;padding:2px 9px;margin-top:8px}
+  .okc-vadd{margin-top:9px;width:100%;background:${BRAND.ink};color:#fff;border:none;border-radius:9px;
+    padding:9px;font-size:13px;cursor:pointer;text-align:center;text-decoration:none;display:block}
   `;
 
   // Identity — always mint a stable device_id (Bloomreach soft id "cookie"). Persist in localStorage
@@ -89,8 +106,11 @@
     '<div class="okc-head"><h4>' + BRAND.name + '</h4><p>Personalized picks, powered by your profile</p></div>' +
     '<div class="okc-body" id="okc-body"></div>' +
     '<div class="okc-tag">Composable demo · Gemini + Loomi + Shopify (backend stub)</div>' +
-    '<div class="okc-foot"><input id="okc-input" placeholder="Ask for a recommendation…" autocomplete="off"/>' +
-    '<button class="okc-send" id="okc-send">Send</button></div>';
+    '<div class="okc-foot">' +
+    '<button class="okc-photo" id="okc-photo" title="Share a photo for a visual recommendation" aria-label="Share a photo">📷</button>' +
+    '<input id="okc-input" placeholder="Ask, or share a photo…" autocomplete="off"/>' +
+    '<button class="okc-send" id="okc-send">Send</button>' +
+    '<input type="file" id="okc-file" accept="image/png,image/jpeg,image/webp" style="display:none"/></div>';
 
   document.body.appendChild(btn);
   document.body.appendChild(panel);
@@ -173,6 +193,65 @@
 
   panel.querySelector("#okc-send").onclick = function () { send(); };
   input.addEventListener("keydown", function (e) { if (e.key === "Enter") send(); });
+
+  // ── Photo → visual recommendation (image IN → image OUT) ──────────────────────────────────────────
+  function visionEndpoint() {
+    var cfg = window.OKAHU_CHAT || {};
+    if (cfg.visionEndpoint) return cfg.visionEndpoint;
+    var ep = cfg.endpoint || "https://mosaic-chat-406265238820.us-east1.run.app/chat";
+    return ep.replace(/\/chat$/, "/vision-chat");
+  }
+  function addUserImage(dataUrl) { var m = el("img", "okc-uimg"); m.src = dataUrl; body.appendChild(m); scroll(); }
+  function addVisionCard(d) {
+    var r = d.recommendation || {}, c = el("div", "okc-vcard"), h = "";
+    // Only accept a base64 image data URI (safe to inline; no quotes/markup possible in base64).
+    var gen = (typeof d.lifestyle_image === "string" && /^data:image\/(png|jpe?g|webp);base64,[A-Za-z0-9+/=]+$/.test(d.lifestyle_image)) ? d.lifestyle_image : null;
+    if (gen) h += '<div class="okc-gen"><span class="okc-genlbl">✨ IMAGINED FOR YOU</span><img src="' + gen + '" alt="your look"/></div>';
+    else if (r.image) h += '<div class="okc-gen"><img src="' + encodeURI(r.image) + '" alt=""/></div>';
+    h += '<div class="okc-vbody"><div class="okc-vname">' + esc(r.product || "Recommended for you") + '</div>';
+    if (r.price) h += '<div class="okc-vprice">$' + esc(r.price) + '</div>';
+    if (r.rationale) h += '<div class="okc-vwhy">' + esc(r.rationale) + '</div>';
+    if (typeof r.propensity === "number") h += '<span class="okc-vprop">match ' + Math.round(r.propensity * 100) + '%</span>';
+    h += '<a class="okc-vadd"' + (r.url ? ' href="' + encodeURI(r.url) + '" target="_blank" rel="noopener"' : '') + '>View product</a></div>';
+    c.innerHTML = h; body.appendChild(c); scroll();
+  }
+  // Downscale client-side (max 1280px, JPEG) so uploads stay small and fast.
+  function downscaleImage(file, cb) {
+    var reader = new FileReader();
+    reader.onload = function () {
+      var img = new Image();
+      img.onload = function () {
+        var max = 1280, w = img.width, h = img.height;
+        if (w > max || h > max) { if (w >= h) { h = Math.round(h * max / w); w = max; } else { w = Math.round(w * max / h); h = max; } }
+        var cv = document.createElement("canvas"); cv.width = w; cv.height = h;
+        cv.getContext("2d").drawImage(img, 0, 0, w, h);
+        try { cb(cv.toDataURL("image/jpeg", 0.85)); } catch (e) { cb(reader.result); }
+      };
+      img.onerror = function () { cb(reader.result); };
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  }
+  function sendPhoto(dataUrl) {
+    addUserImage(dataUrl);
+    var typing = addMsg("Looking at your photo…", "bot");
+    fetch(visionEndpoint(), {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ image: dataUrl, device_id: deviceId(), location: (window.OKAHU_CHAT && window.OKAHU_CHAT.location) || null })
+    }).then(function (r) { return r.json(); }).then(function (d) {
+      if (typing) typing.remove();
+      if (!d || !d.ok) { addMsg("I couldn't analyze that photo — mind trying another?", "bot"); return; }
+      if (d.analysis && d.analysis.visual_analysis) addMsg("Here's what I noticed: " + d.analysis.visual_analysis, "bot");
+      addVisionCard(d);
+    }).catch(function () { if (typing) typing.remove(); addMsg("Hmm, I had trouble analyzing that. Please try again.", "bot"); });
+  }
+  var fileInput = panel.querySelector("#okc-file");
+  panel.querySelector("#okc-photo").onclick = function () { fileInput.click(); };
+  fileInput.addEventListener("change", function () {
+    var f = fileInput.files && fileInput.files[0]; if (!f) return;
+    downscaleImage(f, function (dataUrl) { sendPhoto(dataUrl); });
+    fileInput.value = "";
+  });
 
   var opened = false;
   function greet() {
