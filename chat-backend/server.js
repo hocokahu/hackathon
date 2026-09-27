@@ -149,7 +149,33 @@ async function askGemini({ message, history }) {
   return { reply: parsed.reply || "Sorry, I didn't catch that — could you rephrase?", attributes: parsed.attributes || {} };
 }
 
-async function writeBloomreach({ email, customer_id, attributes }) {
+// Build Bloomreach customer_ids. Hard id = email_id (when known); soft ids = cookie (=device_id) and
+// shopify_id. Passing BOTH email_id and cookie in one command is what stitches an anonymous (cookie)
+// profile into the known (email) one — the anonymous→known merge.
+function brCustomerIds({ email, customer_id, device_id }) {
+  const ids = {};
+  if (email) ids.email_id = String(email);
+  if (device_id) ids.cookie = String(device_id);
+  if (customer_id) ids.shopify_id = String(customer_id);
+  return ids;
+}
+
+// Low-level tracking Batch API call (Public-group Token auth). Never returns the upstream body to the client.
+async function brTrack(customer_ids, properties) {
+  const url = `${BR_API_BASE}/track/v2/projects/${BR_PROJECT_TOKEN}/batch`;
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Token ${BR_API_TOKEN}` },
+    body: JSON.stringify({ commands: [{ name: "customers", data: { customer_ids, properties: properties || {} } }] }),
+  });
+  const body = await resp.text().catch(() => "");
+  let ok = false;
+  try { const j = JSON.parse(body); ok = !!(j.success && j.results && j.results[0] && j.results[0].success); } catch {}
+  if (!ok) console.error("bloomreach write failed", resp.status, body.slice(0, 300)); // log server-side only
+  return { ok, status: resp.status };
+}
+
+async function writeBloomreach({ email, customer_id, device_id, attributes }) {
   // Model output is untrusted: allowlist keys, cap length, reject markup/template/url/control chars.
   const ALLOWED_ATTRS = {
     favorite_color: 60, preferred_location: 80, style_preference: 60, budget_band: 40,
@@ -165,22 +191,29 @@ async function writeBloomreach({ email, customer_id, attributes }) {
     props[k] = v;
   }
   if (!BR_READY || Object.keys(props).length === 0) return { wrote: false, props };
-  if (!email) return { wrote: false, props, reason: "no email (email_id is the hard identifier)" };
 
-  // Tracking Batch API, Public-group Token auth, hard id = email_id. shopify_id added as a soft id when present.
-  const ids = { email_id: email };
-  if (customer_id) ids.shopify_id = String(customer_id);
-  const url = `${BR_API_BASE}/track/v2/projects/${BR_PROJECT_TOKEN}/batch`;
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Token ${BR_API_TOKEN}` },
-    body: JSON.stringify({ commands: [{ name: "customers", data: { customer_ids: ids, properties: props } }] }),
-  });
-  const body = await resp.text().catch(() => "");
-  let ok = false;
-  try { const j = JSON.parse(body); ok = !!(j.success && j.results && j.results[0] && j.results[0].success); } catch {}
-  if (!ok) console.error("bloomreach write failed", resp.status, body.slice(0, 300)); // log server-side only
-  return { wrote: ok, props, status: resp.status }; // never return the upstream body to the client
+  // Identity: email_id when known (writes onto the known profile, and stitches any cookie); otherwise
+  // cookie=device_id (writes onto the anonymous profile). Sending both ids also performs the merge.
+  const ids = brCustomerIds({ email, customer_id, device_id });
+  if (!ids.email_id && !ids.cookie) return { wrote: false, props, reason: "no identity (need email or device_id)" };
+
+  const { ok, status } = await brTrack(ids, props);
+  return { wrote: ok, props, status, identity: ids.email_id ? "email_id" : "cookie", merged: !!(ids.email_id && ids.cookie) };
+}
+
+// Explicit anonymous→known merge: send ONE command carrying both cookie (device_id) and email_id so
+// Bloomreach stitches the anonymous profile into the known one. Email is resolved SERVER-SIDE from the
+// Shopify customer_id when possible (trusted); a client-supplied email is accepted only as a fallback
+// (spoofable — close the auth gap before trusting it in production).
+async function mergeBloomreach({ device_id, email, customer_id }) {
+  if (!BR_READY) return { merged: false, reason: "bloomreach not configured" };
+  if (!device_id) return { merged: false, reason: "device_id required" };
+  let idEmail = null, source = null;
+  if (customer_id) { try { idEmail = await resolveEmail(customer_id); if (idEmail) source = "shopify"; } catch {} }
+  if (!idEmail && typeof email === "string" && email) { idEmail = email; source = "client"; } // fallback: untrusted
+  if (!idEmail) return { merged: false, reason: "no email (pass a Shopify customer_id or email)" };
+  const { ok, status } = await brTrack(brCustomerIds({ email: idEmail, device_id }), {});
+  return { merged: ok, status, identity_source: source };
 }
 
 // Mirror the extracted signal into Databricks (Delta table) so the Databricks agent can reason over it.
@@ -233,25 +266,44 @@ async function resolveEmail(customerId) {
 
 const server = http.createServer(async (req, res) => {
   if (req.method === "OPTIONS") { cors(res); res.writeHead(204); return res.end(); }
+  const path = (req.url || "/").split("?")[0].replace(/\/+$/, "") || "/";
   if (req.method === "GET") return json(res, 200, { ok: true, model: GEMINI_MODEL, bloomreach: BR_READY, databricks: DBX_READY });
   if (req.method !== "POST") return json(res, 405, { error: "method not allowed" });
 
+  let body;
+  try { body = await readBody(req); }
+  catch { return json(res, 400, { error: "invalid request body" }); }
+
+  // Anonymous→known merge (Phase 0): stitch a device_id (cookie) into an email_id profile.
+  if (path === "/merge") {
+    try {
+      const out = await mergeBloomreach({ device_id: body.device_id, email: body.email, customer_id: body.customer_id });
+      return json(res, out.merged ? 200 : 400, out);
+    } catch (e) { console.error("merge error", String(e).slice(0, 300)); return json(res, 500, { error: "merge error" }); }
+  }
+
+  // Chat (default; also serves /chat and /).
   try {
-    const { message, email, customer_id, history } = await readBody(req);
+    const { message, email, customer_id, device_id, history } = body;
     if (!message || !String(message).trim()) return json(res, 400, { error: "message required" });
     if (!GEMINI_API_KEY) return json(res, 500, { error: "server missing GEMINI_API_KEY" });
 
     const { reply, attributes } = await askGemini({ message, history });
 
-    // Identity: prefer an email supplied by the theme; otherwise resolve it from the Shopify customerId.
+    // Identity: prefer a theme-supplied email; else resolve from the Shopify customerId; else stay anonymous (device_id).
     let idEmail = typeof email === "string" && email ? email : null;
     if (!idEmail && customer_id) { try { idEmail = await resolveEmail(customer_id); } catch {} }
 
     let wrote = { wrote: false };
     let dbx = { dbx: false };
-    if (idEmail) {
-      try { wrote = await writeBloomreach({ email: idEmail, customer_id, attributes }); }
+    if (idEmail || device_id) {
+      // Known (email_id) or anonymous (cookie=device_id); passing both ids also stitches the profiles.
+      try { wrote = await writeBloomreach({ email: idEmail, customer_id, device_id, attributes }); }
       catch (e) { console.error("bloomreach write error", String(e).slice(0, 300)); wrote = { wrote: false }; }
+    }
+    if (idEmail) {
+      // Databricks signals table is keyed on email; anonymous (device-only) signals are Bloomreach-only
+      // for Phase 0 (Phase 1: add a device_id column so anonymous signals mirror to Databricks too).
       try { dbx = await writeDatabricks({ email: idEmail, attributes, message }); }
       catch (e) { console.error("databricks write error", String(e).slice(0, 300)); dbx = { dbx: false }; }
     }

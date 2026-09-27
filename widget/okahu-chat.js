@@ -50,6 +50,30 @@
   .okc-tag{font-size:10px;color:#94A3B8;text-align:center;padding:0 0 8px;background:#fff}
   `;
 
+  // Identity — always mint a stable device_id (Bloomreach soft id "cookie"). Persist in localStorage
+  // with a first-party cookie fallback so it survives across visits and storage clears. This is the
+  // anonymous key; it stitches to a known email_id server-side (anonymous→known merge) once the shopper
+  // logs in. NOTE: device_id is a soft, client-minted id by design — it is NOT a trusted email claim.
+  var DEVICE_KEY = "okahu_device_id";
+  function newId() {
+    if (window.crypto && typeof crypto.randomUUID === "function") return crypto.randomUUID();
+    return "dev-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
+  }
+  function deviceId() {
+    var id = null;
+    try { id = localStorage.getItem(DEVICE_KEY); } catch (e) {}
+    if (!id) {
+      try {
+        var m = document.cookie.match(/(?:^|;\s*)okahu_device_id=([^;]+)/);
+        if (m) id = decodeURIComponent(m[1]);
+      } catch (e) {}
+    }
+    if (!id) id = newId();
+    try { localStorage.setItem(DEVICE_KEY, id); } catch (e) {}
+    try { document.cookie = DEVICE_KEY + "=" + encodeURIComponent(id) + ";path=/;max-age=31536000;SameSite=Lax"; } catch (e) {}
+    return id;
+  }
+
   function el(tag, cls, html) { var e = document.createElement(tag); if (cls) e.className = cls; if (html != null) e.innerHTML = html; return e; }
   // Escape any backend/user-supplied text before it touches innerHTML (product titles, chat input, etc.)
   function esc(s) { return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]; }); }
@@ -115,6 +139,7 @@
           message: text,
           email: cust.email || null,
           customer_id: cust.id || shopifyCid || null,
+          device_id: deviceId(),
           history: history.slice(-10)
         })
       }).then(function (r) { return r.json(); }).then(function (d) {
