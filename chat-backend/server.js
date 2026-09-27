@@ -307,6 +307,166 @@ async function resolveEmail(customerId) {
   } catch { return null; }
 }
 
+// ── Phase 1: enrichment leg (weather → reasoning → activation) ──────────────────────────────────
+// Cloud Run does all egress (Open-Meteo weather); Databricks is the brain it calls (ai_query). Reuses
+// the mosaic_weather / mosaic_recommendations Delta tables and writes activation attrs to Bloomreach.
+
+// Run a SQL statement on the Databricks serverless warehouse; return rows for SELECTs.
+async function dbxExec(statement) {
+  if (!DBX_READY) return { ok: false, rows: [], cols: [] };
+  try {
+    const resp = await fetch(`${DBX_HOST}/api/2.0/sql/statements`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${DBX_TOKEN}` },
+      body: JSON.stringify({ statement, warehouse_id: DBX_WAREHOUSE, wait_timeout: "50s" }),
+    });
+    const j = await resp.json().catch(() => ({}));
+    const ok = !!(j && j.status && j.status.state === "SUCCEEDED");
+    const cols = (((j.manifest || {}).schema || {}).columns || []).map((c) => c.name);
+    const rows = ((j.result || {}).data_array) || [];
+    if (!ok) console.error("dbx exec failed", JSON.stringify((j || {}).status || {}).slice(0, 300));
+    return { ok, rows, cols };
+  } catch (e) { console.error("dbx exec error", String(e).slice(0, 200)); return { ok: false, rows: [], cols: [] }; }
+}
+const sqlLit = (v) => (v == null ? "NULL" : `'${String(v).replace(/'/g, "''").slice(0, 800)}'`);
+const sqlNum = (v) => (typeof v === "number" && isFinite(v) ? String(v) : "NULL");
+const sqlBool = (v) => (v === true ? "true" : v === false ? "false" : "NULL");
+
+// Open-Meteo geocode (Cloud Run egress; no API key needed).
+async function geocodeLocation(name) {
+  const url = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(String(name).slice(0, 80))}&count=1&language=en&format=json`;
+  const r = await fetch(url);
+  if (!r.ok) return null;
+  const d = await r.json().catch(() => ({}));
+  const g = d && d.results && d.results[0];
+  if (!g) return null;
+  return { lat: g.latitude, lon: g.longitude, name: [g.name, g.admin1, g.country_code].filter(Boolean).join(", ") };
+}
+
+// Open-Meteo 7-day forecast → summarized weather.
+async function fetchForecast(lat, lon) {
+  const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
+    `&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max&temperature_unit=fahrenheit&forecast_days=7&timezone=auto`;
+  const r = await fetch(url);
+  if (!r.ok) return null;
+  const d = await r.json().catch(() => ({}));
+  const day = d && d.daily;
+  if (!day || !Array.isArray(day.time)) return null;
+  const highs = (day.temperature_2m_max || []).filter((x) => typeof x === "number");
+  const lows = (day.temperature_2m_min || []).filter((x) => typeof x === "number");
+  const precs = (day.precipitation_probability_max || []).filter((x) => typeof x === "number");
+  const hi = highs.length ? Math.round(Math.max(...highs)) : null;
+  const lo = lows.length ? Math.round(Math.min(...lows)) : null;
+  const pr = precs.length ? Math.max(...precs) : null;
+  const summary = `Highs to ${hi}F, lows to ${lo}F, max rain chance ${pr}% over the next 7 days`;
+  return { temp_high_f: hi, temp_low_f: lo, precip_prob_max: pr, summary, week_start: day.time[0], forecast_json: JSON.stringify(day).slice(0, 4000) };
+}
+
+// Pull the shopper's latest chat signal as context for reasoning (activity, interest, location, style).
+async function getCustomerContext(email) {
+  const ctxCols = ["favorite_activity", "favorite_location", "summer_interest", "favorite_color", "style_preference", "budget_band"];
+  const q = await dbxExec(
+    `SELECT ${ctxCols.join(",")} FROM ${DBX_SIGNALS_TABLE} WHERE email = ${sqlLit(email)} ORDER BY created_at DESC LIMIT 1`
+  );
+  const ctx = {};
+  if (q.ok && q.rows[0]) q.cols.forEach((c, i) => { if (q.rows[0][i] != null) ctx[c] = q.rows[0][i]; });
+  return ctx;
+}
+
+// Ask the Databricks-hosted Claude (ai_query) for the next-best product + propensity, given context + weather.
+async function reason({ email, context, weather }) {
+  const ctxLine = Object.entries(context || {}).map(([k, v]) => `${k}=${v}`).join(", ") || "no stated preferences yet";
+  const w = weather ? `Weather for ${weather.location} next week: ${weather.summary}.` : "Weather unknown.";
+  const prompt = [
+    "You are a product recommendation engine for an outdoor and snowboard store.",
+    `Shopper context: ${ctxLine}.`, w,
+    "Recommend the single best next product to cross-sell and a purchase propensity from 0 to 1.",
+    'Return ONLY compact JSON, no prose: {"recommended_product":"<name>","propensity":<0-1>,"rationale":"<one sentence>"}',
+  ].join(" ");
+  const q = await dbxExec(`SELECT ai_query('databricks-claude-sonnet-4-5', ${sqlLit(prompt)}) AS out`);
+  if (!q.ok || !q.rows[0]) return null;
+  let text = String(q.rows[0][0] || "");
+  const m = text.match(/\{[\s\S]*\}/); // pull the JSON object out of any wrapper text
+  if (m) text = m[0];
+  try {
+    const p = JSON.parse(text);
+    const prop = Number(p.propensity);
+    return {
+      recommended_product: typeof p.recommended_product === "string" ? p.recommended_product.slice(0, 80) : null,
+      propensity: isFinite(prop) ? Math.max(0, Math.min(1, Math.round(prop * 100) / 100)) : null,
+      rationale: typeof p.rationale === "string" ? p.rationale.slice(0, 300) : null,
+    };
+  } catch { return null; }
+}
+
+// Validate + write activation attributes to Bloomreach (product/rationale come from the LLM — untrusted).
+function activationProps({ rec, weather }) {
+  const props = {};
+  const clean = (v, max) => {
+    if (typeof v !== "string") return null; v = v.trim();
+    if (!v || v.length > max) return null;
+    if (/[<>{}$\u0000-\u001f]/.test(v) || /https?:\/\//i.test(v)) return null;
+    return v;
+  };
+  if (rec) {
+    const p = clean(rec.recommended_product, 80);
+    if (p) { props.next_best_product = p; props.predicted_next_purchase = p; }
+    if (typeof rec.propensity === "number") props.recommendation_propensity = rec.propensity;
+    const r = clean(rec.rationale, 300);
+    if (r) props.recommendation_rationale = r;
+    props.recommendation_model = "databricks-claude-sonnet-4-5 (Databricks Model Serving)";
+  }
+  if (weather) {
+    const wl = clean(weather.location, 80); if (wl) props.weather_location = wl;
+    if (typeof weather.temp_high_f === "number") props.weather_next_week_high_f = weather.temp_high_f;
+    if (typeof weather.temp_low_f === "number") props.weather_next_week_low_f = weather.temp_low_f;
+    const ws = clean(weather.summary, 200); if (ws) props.weather_next_week_summary = ws;
+  }
+  return props;
+}
+
+// Orchestrate: resolve location → weather (+store) → reason → write recommendation (+ activate Bloomreach).
+async function enrich({ email, device_id, location }) {
+  if (!email) return { ok: false, reason: "email required for enrichment" };
+  const context = await getCustomerContext(email);
+  const loc = (typeof location === "string" && location.trim()) || context.favorite_location || context.preferred_location || null;
+  if (!loc) return { ok: false, reason: "no location (pass location, or set favorite_location via chat first)" };
+
+  let weather = null;
+  const geo = await geocodeLocation(loc);
+  if (geo) {
+    const fc = await fetchForecast(geo.lat, geo.lon);
+    if (fc) {
+      weather = { location: geo.name, lat: geo.lat, lon: geo.lon, ...fc };
+      // store in mosaic_weather
+      await dbxExec(
+        `INSERT INTO workspace.default.mosaic_weather (location,lat,lon,week_start,temp_high_f,temp_low_f,precip_prob_max,summary,forecast_json,fetched_at) VALUES (` +
+        `${sqlLit(weather.location)},${sqlNum(weather.lat)},${sqlNum(weather.lon)},${sqlLit(weather.week_start)},${sqlNum(weather.temp_high_f)},${sqlNum(weather.temp_low_f)},${sqlNum(weather.precip_prob_max)},${sqlLit(weather.summary)},${sqlLit(weather.forecast_json)},current_timestamp())`
+      );
+    }
+  }
+
+  const rec = await reason({ email, context, weather });
+  if (!rec || !rec.recommended_product) return { ok: false, reason: "reasoning failed", weather, context };
+
+  // store the recommendation
+  const ownsSnowboard = context.favorite_activity && /snowboard/i.test(context.favorite_activity) ? true : null;
+  await dbxExec(
+    `INSERT INTO workspace.default.mosaic_recommendations (email,recommended_product,propensity,rationale,weather_summary,owns_snowboard,model,created_at) VALUES (` +
+    `${sqlLit(email)},${sqlLit(rec.recommended_product)},${sqlNum(rec.propensity)},${sqlLit(rec.rationale)},${sqlLit(weather && weather.summary)},${sqlBool(ownsSnowboard)},${sqlLit("databricks-claude-sonnet-4-5")},current_timestamp())`
+  );
+
+  // activate onto the Bloomreach profile
+  let activated = false;
+  if (BR_READY) {
+    const props = activationProps({ rec, weather });
+    const ids = brCustomerIds({ email, device_id });
+    const { ok } = await brTrack(ids, props);
+    activated = ok;
+  }
+  return { ok: true, location: loc, weather, recommendation: rec, activated };
+}
+
 const server = http.createServer(async (req, res) => {
   if (req.method === "OPTIONS") { cors(res); res.writeHead(204); return res.end(); }
   const u = new URL(req.url || "/", "http://localhost");
@@ -340,6 +500,21 @@ const server = http.createServer(async (req, res) => {
       const out = await mergeBloomreach({ device_id: body.device_id, customer_id: trustedCustomerId });
       return json(res, 200, out);
     } catch (e) { console.error("merge error", String(e).slice(0, 300)); return json(res, 500, { error: "server error" }); }
+  }
+
+  // Enrichment (Phase 1): weather → ai_query reasoning → Databricks + Bloomreach activation. This is the
+  // always-on replacement for the manual mosaic_agent.py. /enrich accepts an optional location; /agent/run
+  // reads it from the shopper's stored context. Internal/agent route — in production put it behind auth.
+  // Identity: trusted customer id (proxy) → resolve email; else customer_id → resolve; else a direct email.
+  if (path === "/enrich" || path === "/agent/run") {
+    try {
+      let email = null;
+      if (trustedCustomerId) { try { email = await resolveEmail(trustedCustomerId); } catch {} }
+      if (!email && body.customer_id) { try { email = await resolveEmail(body.customer_id); } catch {} }
+      if (!email && typeof body.email === "string" && body.email) email = body.email;
+      const out = await enrich({ email, device_id: body.device_id, location: body.location });
+      return json(res, out.ok ? 200 : 400, out);
+    } catch (e) { console.error("enrich error", String(e).slice(0, 300)); return json(res, 500, { error: "enrich error" }); }
   }
 
   // Chat (default; also serves /chat and /).
