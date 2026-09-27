@@ -119,6 +119,12 @@
 
   function scroll() { body.scrollTop = body.scrollHeight; }
   function addMsg(text, who) { var m = el("div", "okc-msg " + (who === "user" ? "okc-user" : "okc-bot"), esc(text)); body.appendChild(m); scroll(); return m; }
+  // Render an AI-generated image (base64 data URI only) as a card in the chat.
+  function addGenImage(dataUri) {
+    var c = el("div", "okc-vcard");
+    c.innerHTML = '<div class="okc-gen"><span class="okc-genlbl">✨ GENERATED FOR YOU</span><img src="' + dataUri + '" alt="generated image"/></div>';
+    body.appendChild(c); scroll(); return c;
+  }
   function addChips(items) {
     var wrap = el("div", "okc-chips");
     items.forEach(function (t) { var c = el("button", "okc-chip", t); c.onclick = function () { send(t); }; wrap.appendChild(c); });
@@ -166,6 +172,8 @@
         if (typing) typing.remove();
         var reply = (d && d.reply) || "Sorry — I couldn't reach the assistant just now.";
         addMsg(reply, "bot");
+        // Generated image (text-to-image). Only a base64 data URI is accepted (safe to inline).
+        if (d && typeof d.image === "string" && /^data:image\/(png|jpe?g|webp);base64,[A-Za-z0-9+/=]+$/.test(d.image)) addGenImage(d.image);
         if (d && d.cards && d.cards.length) addCards(d.cards);
         if (d && d.chips && d.chips.length) addChips(d.chips);
         history.push({ role: "user", text: text }, { role: "model", text: reply });

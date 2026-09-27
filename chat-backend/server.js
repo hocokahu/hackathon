@@ -364,6 +364,28 @@ async function dbxExec(statement) {
     return { ok, rows, cols };
   } catch (e) { console.error("dbx exec error", String(e).slice(0, 200)); return { ok: false, rows: [], cols: [] }; }
 }
+
+// Store a generated image (a data URI) INTO a Unity Catalog Volume so Databricks holds a copy too.
+// Cloud Run is the courier: it PUTs the bytes into Databricks (inbound = allowed); Databricks never
+// dials out to fetch an image. Returns { path, url } (the Files-API url) or null on failure.
+const DBX_IMAGE_VOLUME = process.env.DATABRICKS_IMAGE_VOLUME || "/Volumes/workspace/default/mosaic_images";
+async function saveImageToDatabricks(dataUri, keyHint) {
+  if (!DBX_READY || !dataUri) return null;
+  const m = String(dataUri).match(/^data:([^;]+);base64,(.*)$/s);
+  if (!m) return null;
+  const ext = ((m[1].split("/")[1] || "png").replace(/[^a-z0-9]/gi, "")) || "png";
+  const safe = String(keyHint || "anon").replace(/[^a-z0-9]/gi, "_").slice(0, 40);
+  const vpath = `${DBX_IMAGE_VOLUME}/vision_${safe}_${Date.now()}.${ext}`;
+  try {
+    const resp = await fetch(`${DBX_HOST}/api/2.0/fs/files${vpath}?overwrite=true`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/octet-stream", Authorization: `Bearer ${DBX_TOKEN}` },
+      body: Buffer.from(m[2], "base64"),
+    });
+    if (resp.status !== 204 && resp.status !== 200) { console.error("dbx image save http", resp.status); return null; }
+    return { path: vpath, url: `${DBX_HOST}/api/2.0/fs/files${vpath}` };
+  } catch (e) { console.error("dbx image save error", String(e).slice(0, 200)); return null; }
+}
 const sqlLit = (v) => (v == null ? "NULL" : `'${String(v).replace(/\\/g, "\\\\").replace(/'/g, "''").slice(0, 800)}'`);
 const sqlNum = (v) => (typeof v === "number" && isFinite(v) ? String(v) : "NULL");
 const sqlBool = (v) => (v === true ? "true" : v === false ? "false" : "NULL");
@@ -680,10 +702,13 @@ async function visionEnrich({ email, device_id, image, location, generateImage =
     lifestyle = await generateLifestyleImage({ prompt: p, inputImageDataUri: img.dataUri });
   }
 
+  // Store the generated image INTO Databricks (Unity Catalog Volume) — Cloud Run carries the bytes in.
+  const dbxImage = lifestyle ? await saveImageToDatabricks(lifestyle, email || device_id) : null;
+
   // Persist to Databricks (keyed on email when known, else device_id).
   await dbxExec(
-    `INSERT INTO ${DBX_VISION_TABLE} (email,device_id,visual_analysis,recommended_product,matched_sku,matched_product,propensity,rationale,weather_summary,image_generated,model,created_at) VALUES (` +
-    `${sqlLit(email)},${sqlLit(device_id)},${sqlLit(analysis.visual_analysis)},${sqlLit(analysis.recommended_product)},${sqlLit(product && String(product.id))},${sqlLit(product && product.title)},${sqlNum(analysis.propensity)},${sqlLit(analysis.rationale)},${sqlLit(weather && weather.summary)},${sqlBool(!!lifestyle)},${sqlLit(DBX_VISION_ENDPOINT + " (vision, Databricks Model Serving)")},current_timestamp())`
+    `INSERT INTO ${DBX_VISION_TABLE} (email,device_id,visual_analysis,recommended_product,matched_sku,matched_product,propensity,rationale,weather_summary,image_generated,image_path,model,created_at) VALUES (` +
+    `${sqlLit(email)},${sqlLit(device_id)},${sqlLit(analysis.visual_analysis)},${sqlLit(analysis.recommended_product)},${sqlLit(product && String(product.id))},${sqlLit(product && product.title)},${sqlNum(analysis.propensity)},${sqlLit(analysis.rationale)},${sqlLit(weather && weather.summary)},${sqlBool(!!lifestyle)},${sqlLit(dbxImage && dbxImage.path)},${sqlLit(DBX_VISION_ENDPOINT + " (vision, Databricks Model Serving)")},current_timestamp())`
   );
 
   // Activate onto the Bloomreach profile (attrs allowlisted/validated — LLM output is untrusted).
@@ -704,6 +729,7 @@ async function visionEnrich({ email, device_id, image, location, generateImage =
     analysis, product,
     recommendation: { product: (product && product.title) || analysis.recommended_product, price: product && product.price, image: product && product.image, url: product && product.url, propensity: analysis.propensity, rationale: analysis.rationale },
     lifestyle_image: lifestyle, activated,
+    databricks_image: dbxImage,
   };
 }
 
@@ -813,6 +839,20 @@ const server = http.createServer(async (req, res) => {
     let idEmail = null;
     if (trustedCustomerId) { try { idEmail = await resolveEmail(trustedCustomerId); } catch {} }
 
+    // Text-to-image: if the shopper asks to generate/create/draw an image, make one with Gemini and
+    // store it IN Databricks (Cloud Run carries the bytes in). Returned inline so the widget renders it.
+    let genImage = null, genImageDbx = null, finalReply = reply;
+    const wantsImage = /\b(image|picture|photo|pic|visual|render|mockup|drawing)\b/i.test(message) &&
+                       /\b(generate|create|make|draw|show|imagine|render|design|see|visuali[sz]e)\b/i.test(message);
+    if (wantsImage && GEMINI_API_KEY) {
+      const scene = String(message).replace(/\b(please|can you|could you|generate|create|make|draw|show me|an?|image|picture|photo|of)\b/gi, " ").replace(/\s+/g, " ").trim() || String(message);
+      genImage = await generateLifestyleImage({ prompt: scene, inputImageDataUri: null });
+      if (genImage) {
+        genImageDbx = await saveImageToDatabricks(genImage, idEmail || device_id || "chat");
+        finalReply = "Here's what I imagined for you ✨ — want me to find the closest real match in the store?";
+      }
+    }
+
     let wrote = { wrote: false };
     let dbx = { dbx: false };
     if (idEmail || device_id) {
@@ -826,7 +866,7 @@ const server = http.createServer(async (req, res) => {
       try { dbx = await writeDatabricks({ email: idEmail, attributes, message }); }
       catch (e) { console.error("databricks write error", String(e).slice(0, 300)); dbx = { dbx: false }; }
     }
-    return json(res, 200, { reply, extracted: attributes, ...wrote, ...dbx });
+    return json(res, 200, { reply: finalReply, extracted: attributes, image: genImage, image_databricks: genImageDbx, ...wrote, ...dbx });
   } catch (e) {
     console.error("assistant error", String(e).slice(0, 300));
     return json(res, 500, { error: "assistant error" });
