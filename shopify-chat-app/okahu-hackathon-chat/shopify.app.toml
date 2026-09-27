@@ -22,6 +22,14 @@ scopes = "write_products"
 [auth]
 redirect_urls = [ "https://shopify.dev/apps/default-app-home/api/auth" ]
 
+# App Proxy: Shopify proxies /apps/mosaic/* on the storefront to our Cloud Run backend, appending a
+# signed `signature` + a server-set `logged_in_customer_id`. The backend verifies the signature
+# (SHOPIFY_APP_PROXY_SECRET = this app's client secret) and trusts ONLY that customer id.
+[app_proxy]
+url = "https://mosaic-chat-406265238820.us-east1.run.app"
+prefix = "apps"
+subpath = "mosaic"
+
 [metaobjects.app.faq]
 name = "FAQ"
 

@@ -12,6 +12,7 @@
  */
 "use strict";
 const http = require("node:http");
+const crypto = require("node:crypto");
 
 const PORT = process.env.PORT || 8080;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
@@ -30,6 +31,32 @@ const BR_READY = Boolean(BR_API_BASE && BR_PROJECT_TOKEN && BR_API_TOKEN); // bo
 const SHOP_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN || "";
 const SHOP_TOKEN = process.env.SHOPIFY_ADMIN_API_TOKEN || "";
 const SHOP_VER = process.env.SHOPIFY_API_VERSION || "2025-01";
+
+// Shopify App Proxy (the real identity lock). When the storefront calls us THROUGH the app proxy
+// (/apps/<subpath>/*), Shopify appends a `signature` (HMAC-SHA256 of the sorted query params, keyed by
+// the app's client secret) and a SERVER-SET `logged_in_customer_id` that the client cannot forge. We
+// verify the signature and trust ONLY that customer id — never a client-asserted email or customer_id.
+// SHOPIFY_APP_PROXY_SECRET = the chat app's client secret. REQUIRE_APP_PROXY=true enforces the lock
+// (identity accepted only from a verified proxy request); false keeps the pre-proxy behavior during rollout.
+const APP_PROXY_SECRET = process.env.SHOPIFY_APP_PROXY_SECRET || "";
+const REQUIRE_APP_PROXY = String(process.env.REQUIRE_APP_PROXY || "").toLowerCase() === "true";
+
+// Verify a Shopify App Proxy request. Returns { valid, logged_in_customer_id }. Signature algorithm:
+// take all query params except `signature`, sort by key, join as key=value with NO separator (array
+// values joined by comma), HMAC-SHA256 with the app secret, hex-compare (timing-safe) to `signature`.
+function verifyAppProxy(searchParams) {
+  if (!APP_PROXY_SECRET) return { valid: false, logged_in_customer_id: null };
+  const sig = searchParams.get("signature");
+  if (!sig) return { valid: false, logged_in_customer_id: null };
+  const keys = [];
+  for (const k of searchParams.keys()) if (k !== "signature" && !keys.includes(k)) keys.push(k);
+  keys.sort();
+  const msg = keys.map((k) => `${k}=${searchParams.getAll(k).join(",")}`).join("");
+  const digest = crypto.createHmac("sha256", APP_PROXY_SECRET).update(msg).digest("hex");
+  const a = Buffer.from(digest, "utf8"), b = Buffer.from(sig, "utf8");
+  const valid = a.length === b.length && crypto.timingSafeEqual(a, b);
+  return { valid, logged_in_customer_id: valid ? (searchParams.get("logged_in_customer_id") || null) : null };
+}
 
 // Databricks (optional) — mirror the chat signal into a Delta table so the Databricks agent can
 // reason over it. Uses the SQL Statement Execution API against a serverless warehouse. If unset,
@@ -282,9 +309,14 @@ async function resolveEmail(customerId) {
 
 const server = http.createServer(async (req, res) => {
   if (req.method === "OPTIONS") { cors(res); res.writeHead(204); return res.end(); }
-  const path = (req.url || "/").split("?")[0].replace(/\/+$/, "") || "/";
-  if (req.method === "GET") return json(res, 200, { ok: true, model: GEMINI_MODEL, bloomreach: BR_READY, databricks: DBX_READY });
+  const u = new URL(req.url || "/", "http://localhost");
+  const path = u.pathname.replace(/\/+$/, "") || "/";
+  if (req.method === "GET") return json(res, 200, { ok: true, model: GEMINI_MODEL, bloomreach: BR_READY, databricks: DBX_READY, app_proxy: Boolean(APP_PROXY_SECRET), require_app_proxy: REQUIRE_APP_PROXY });
   if (req.method !== "POST") return json(res, 405, { error: "method not allowed" });
+
+  // Verify the Shopify App Proxy signature (present when the request came through /apps/<subpath>/*).
+  // A valid signature yields a SERVER-SET logged_in_customer_id we can trust as the shopper's identity.
+  const proxy = verifyAppProxy(u.searchParams);
 
   // Rate-limit key: use the LAST X-Forwarded-For hop (appended by Cloud Run's front end). Earlier XFF
   // values are client-supplied and spoofable, so never key off XFF[0]. Fall back to the socket address.
@@ -296,33 +328,38 @@ const server = http.createServer(async (req, res) => {
   try { body = await readBody(req); }
   catch { return json(res, 400, { error: "invalid request body" }); }
 
-  // Anonymous→known merge (Phase 0): stitch a device_id (cookie) into an email_id profile.
-  // Identity is resolved server-side from the Shopify customer_id; uniform response (no enumeration oracle).
+  // Trusted customer id: from the verified app proxy (logged_in_customer_id) when present. With
+  // REQUIRE_APP_PROXY on, that is the ONLY accepted source (the client cannot assert an identity);
+  // otherwise fall back to the pre-proxy, client-supplied body.customer_id during rollout.
+  const trustedCustomerId = proxy.valid ? proxy.logged_in_customer_id : (REQUIRE_APP_PROXY ? null : body.customer_id);
+
+  // Anonymous→known merge: stitch a device_id (cookie) into an email_id profile. Identity resolved
+  // server-side from the trusted customer id only; uniform response (no enumeration oracle).
   if (path === "/merge") {
     try {
-      const out = await mergeBloomreach({ device_id: body.device_id, customer_id: body.customer_id });
+      const out = await mergeBloomreach({ device_id: body.device_id, customer_id: trustedCustomerId });
       return json(res, 200, out);
     } catch (e) { console.error("merge error", String(e).slice(0, 300)); return json(res, 500, { error: "server error" }); }
   }
 
   // Chat (default; also serves /chat and /).
   try {
-    const { message, customer_id, device_id, history } = body;
+    const { message, device_id, history } = body;
     if (!message || !String(message).trim()) return json(res, 400, { error: "message required" });
     if (!GEMINI_API_KEY) return json(res, 500, { error: "server missing GEMINI_API_KEY" });
 
     const { reply, attributes } = await askGemini({ message, history });
 
-    // Identity is derived SERVER-SIDE from the Shopify customer_id — a client-asserted email is NEVER
-    // trusted (spoofable). Logged-in shoppers arrive with a customer_id; anonymous shoppers use device_id.
+    // Identity comes ONLY from the trusted customer id (verified app proxy, or the pre-proxy fallback).
+    // A client-asserted email/customer_id in the body is NEVER trusted for a known-profile write.
     let idEmail = null;
-    if (customer_id) { try { idEmail = await resolveEmail(customer_id); } catch {} }
+    if (trustedCustomerId) { try { idEmail = await resolveEmail(trustedCustomerId); } catch {} }
 
     let wrote = { wrote: false };
     let dbx = { dbx: false };
     if (idEmail || device_id) {
       // Known (email_id) or anonymous (cookie=device_id); passing both ids also stitches the profiles.
-      try { wrote = await writeBloomreach({ email: idEmail, customer_id, device_id, attributes }); }
+      try { wrote = await writeBloomreach({ email: idEmail, customer_id: trustedCustomerId, device_id, attributes }); }
       catch (e) { console.error("bloomreach write error", String(e).slice(0, 300)); wrote = { wrote: false }; }
     }
     if (idEmail) {
