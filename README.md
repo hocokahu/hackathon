@@ -10,24 +10,40 @@ One rule shapes the whole design: the Databricks workspace here has no outbound 
 does everything that touches the outside world (weather, Gemini, Shopify, Bloomreach) and carries data
 *into* Databricks. Databricks only reads and writes its own tables and files.
 
+## What it does
+
+We turn an ordinary conversation into **structured customer intent**, then let the composable stack
+act on it (Databricks · Google/Gemini · Bloomreach · Shopify).
+
+- **Store agent.** The Shopify storefront chatbot turns a shopper's chat (and photos) into structured
+  profile attributes — `favorite_activity`, `favorite_location`, `summer_interest`, `prior_purchase`, …
+- **MES — Mosaic Enrichment Service** (Gemini · GCP Cloud Run). One service, four jobs: **extract**
+  attributes (Gemini structured output), **identify + merge** the shopper (hard `email_id`, soft
+  `cookie`/`device_id`), **enrich** (weather via Open-Meteo, next-best-product + propensity, vision),
+  and **write** to the Bloomreach profile plus Databricks Delta tables (`mosaic_chat_signals`,
+  `mosaic_recommendations`, `mosaic_vision_reco`).
+- **MAIS — Mosaic AI Scenario** (Databricks Agent Bricks). Describe a campaign in plain language and
+  the agent assembles a Bloomreach scenario — **segment → predict → activate** — from Agent Bricks
+  scores, Bloomreach auto-segmentation, and an AutoML purchase-likelihood prediction.
+- **Gateway integration.** A Shopify storefront chatbot and a Slack bot both feed the loop, updating
+  Bloomreach and Databricks.
+
+## Use cases
+
+1. **Storefront recommendations.** A shopper chats with the Shopify bot and gets product
+   recommendations; the chat session is logged as a user-intent event with custom attributes.
+2. **Scenario activation.** A Bloomreach scenario activates and emails the shopper the recommended
+   product.
+3. **Image → deeper attributes.** When an image is generated, Agent Bricks runs further analysis to
+   extract additional attributes (favorite, interest, location, …).
+4. **Slack scenario builder.** A backend Slack bot lets a Bloomreach admin chat and generate scenarios
+   dynamically via the Loomi MCP.
+
 ## Architecture
 
 [![Team Mosaic architecture](docs/mosaic-architecture.svg)](https://hocokahu.github.io/hackathon/mosaic-architecture.html)
 
 ▶ **[Open the interactive diagram](https://hocokahu.github.io/hackathon/mosaic-architecture.html)** — pan, zoom, trace, light/dark, and export.
-
-## What it does
-
-- **Chat.** Shopper chats on the storefront. Gemini replies and pulls out interests (activity, color,
-  location), which get written to Bloomreach and Databricks.
-- **Photo in, look out.** Shopper uploads a photo. Databricks (Claude Sonnet 4.5 vision) reads the
-  scene and gear, recommends a real Shopify product, Gemini generates a lifestyle image, and the pick
-  lands on the Bloomreach profile.
-- **Generate an image.** Shopper asks the chat for an image. Gemini makes one from the whole
-  conversation and saves it into Databricks. A Databricks job reads that image, extracts the
-  preference, and updates the customer table. Cloud Run then pushes the preference to Bloomreach.
-- **Email.** Each recipient's email uses their own data: real forecast, the recommended product, and a
-  cart link that drops them straight into checkout.
 
 ## Repo layout
 
