@@ -122,7 +122,7 @@
   // Render an AI-generated image (base64 data URI only) as a card in the chat.
   function addGenImage(dataUri) {
     var c = el("div", "okc-vcard");
-    c.innerHTML = '<div class="okc-gen"><span class="okc-genlbl">✨ GENERATED FOR YOU</span><img src="' + dataUri + '" alt="generated image"/></div>';
+    c.innerHTML = '<div class="okc-gen"><span class="okc-genlbl">✨</span><img src="' + dataUri + '" alt="generated image"/></div>';
     body.appendChild(c); scroll(); return c;
   }
   function addChips(items) {
