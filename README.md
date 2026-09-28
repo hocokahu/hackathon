@@ -10,6 +10,12 @@ One rule shapes the whole design: the Databricks workspace here has no outbound 
 does everything that touches the outside world (weather, Gemini, Shopify, Bloomreach) and carries data
 *into* Databricks. Databricks only reads and writes its own tables and files.
 
+## Architecture
+
+[![Team Mosaic architecture](docs/mosaic-architecture.svg)](https://hocokahu.github.io/hackathon/mosaic-architecture.html)
+
+▶ **[Open the interactive diagram](https://hocokahu.github.io/hackathon/mosaic-architecture.html)** — pan, zoom, trace, light/dark, and export.
+
 ## What it does
 
 - **Chat.** Shopper chats on the storefront. Gemini replies and pulls out interests (activity, color,
