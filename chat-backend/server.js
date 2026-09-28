@@ -845,11 +845,23 @@ const server = http.createServer(async (req, res) => {
     const wantsImage = /\b(image|picture|photo|pic|visual|render|mockup|drawing)\b/i.test(message) &&
                        /\b(generate|create|make|draw|show|imagine|render|design|see|visuali[sz]e)\b/i.test(message);
     if (wantsImage && GEMINI_API_KEY) {
-      const scene = String(message).replace(/\b(please|can you|could you|generate|create|make|draw|show me|an?|image|picture|photo|of)\b/gi, " ").replace(/\s+/g, " ").trim() || String(message);
+      // Build the scene from the WHOLE session (prior user turns + this message), not just the last line.
+      const priorUser = Array.isArray(history) ? history.filter((h) => h && h.role === "user" && h.text).map((h) => String(h.text)) : [];
+      const sessionText = [...priorUser, String(message)].join(". ").slice(0, 600);
+      const scene = sessionText.replace(/\b(please|can you|could you|generate|create|make|draw|show me|an?|image|picture|photo|of)\b/gi, " ").replace(/\s+/g, " ").trim() || String(message);
       genImage = await generateLifestyleImage({ prompt: scene, inputImageDataUri: null });
       if (genImage) {
         genImageDbx = await saveImageToDatabricks(genImage, idEmail || device_id || "chat");
         finalReply = "Here's what I imagined for you ✨ — want me to find the closest real match in the store?";
+        // Queue the saved image for the Databricks vision job: record user <-> image_path (+ session scene).
+        if (genImageDbx && genImageDbx.path && (idEmail || device_id)) {
+          try {
+            await dbxExec(
+              `INSERT INTO ${DBX_VISION_TABLE} (email,device_id,visual_analysis,recommended_product,image_generated,image_path,model,created_at) VALUES (` +
+              `${sqlLit(idEmail)},${sqlLit(device_id)},${sqlLit("chat image-gen: " + scene)},NULL,true,${sqlLit(genImageDbx.path)},${sqlLit("chat-image-gen (gemini)")},current_timestamp())`
+            );
+          } catch (e) { console.error("queue row error", String(e).slice(0, 200)); }
+        }
       }
     }
 
@@ -872,5 +884,31 @@ const server = http.createServer(async (req, res) => {
     return json(res, 500, { error: "assistant error" });
   }
 });
+
+// ── Preference poller ───────────────────────────────────────────────────────────────────────────────
+// Databricks has NO outbound internet, so it can't push to Bloomreach. This poller (in Cloud Run, which
+// does have egress) periodically pulls freshly-extracted preferences from Databricks and activates them
+// onto the Bloomreach profile, then marks them pushed. This is the "trigger" that moves a Databricks-
+// derived preference out to Bloomreach.
+async function pushPreferencesToBloomreach() {
+  if (!DBX_READY || !BR_READY) return;
+  try {
+    const q = await dbxExec(
+      "SELECT email, device_id, image_generation, image_file FROM workspace.default.mosaic_user_preferences WHERE pushed_to_br = false ORDER BY analyzed_at DESC LIMIT 20"
+    );
+    if (!q.ok || !q.rows.length) return;
+    for (const r of q.rows) {
+      const email = r[0], device_id = r[1], image_file = r[3];
+      // Sanitize the model-derived value (untrusted): no markup/template/control chars, capped.
+      let val = typeof r[2] === "string" ? r[2].trim().toLowerCase().slice(0, 80) : "";
+      if (!val || /[<>{}$\u0000-\u001f]/.test(val)) continue;
+      const ids = brCustomerIds({ email, device_id });
+      if (Object.keys(ids).length === 0) continue;
+      const { ok } = await brTrack(ids, { image_generation: val, image_generation_source: "databricks-vision-job" });
+      if (ok) await dbxExec(`UPDATE workspace.default.mosaic_user_preferences SET pushed_to_br = true WHERE image_file = ${sqlLit(image_file)}`);
+    }
+  } catch (e) { console.error("pref poller error", String(e).slice(0, 200)); }
+}
+if (DBX_READY && BR_READY) setInterval(pushPreferencesToBloomreach, 25000);
 
 server.listen(PORT, () => console.log(`chat backend on :${PORT} (model ${GEMINI_MODEL}, bloomreach ${BR_READY ? "on" : "off"})`));
