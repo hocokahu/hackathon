@@ -4,6 +4,16 @@ The reasoning brain behind Phase 2: a multimodal agent that looks at a **shopper
 recommends a real product. This is the analysis a behavioral engine (Bloomreach) cannot do — it has
 no way to *see* the customer's image.
 
+## Files in this folder
+
+- `schema.sql` — the Unity Catalog tables, the `mosaic_images` volume, and the two UC function tools
+  (`get_customer_context`, `get_weather_forecast`). Run this first to recreate the Databricks side.
+- `mosaic_analyze_images.py` — the **live** vision job (a notebook). On file arrival in the volume it
+  reads each new image, runs `databricks-claude-sonnet-4-5` vision to name the product/activity in a
+  few words, and writes it to `mosaic_user_preferences.image_generation`.
+- `agent.py` / `deploy_agent.py` — the Agent Framework version of the vision brain (see below). Not
+  the path currently running; the live demo calls the model endpoint directly.
+
 ## Two paths (same brain)
 
 | | What runs | Where | Status |
@@ -25,32 +35,32 @@ Databricks serverless here has **no outbound internet**. So:
 - **Databricks** only ever *receives* the call and *reads its own Unity Catalog data*. The agent's
   tools read tables Cloud Run fills; the agent never dials out.
 
-## Tools (Unity Catalog functions, already created)
+## Tools and tables (defined in `schema.sql`)
 
-- `workspace.default.get_customer_context(email)` — reads the shopper's latest cross-platform signals
-  from `workspace.default.mosaic_chat_signals`.
-- `workspace.default.get_weather_forecast(location)` — reads the forecast Cloud Run wrote to
-  `workspace.default.mosaic_weather`.
-- *(optional)* a **Genie Space** as a tool — set `MOSAIC_GENIE_SPACE_ID` to let the agent ask
-  ad-hoc questions over the store's data.
+- `workspace.default.get_customer_context(email)` — latest cross-platform signals from `mosaic_chat_signals`.
+- `workspace.default.get_weather_forecast(location)` — latest forecast from `mosaic_weather` (Cloud Run fills it).
+- Tables: `mosaic_chat_signals`, `mosaic_recommendations`, `mosaic_weather`, `mosaic_vision_reco`
+  (image queue, has `image_path`), `mosaic_user_preferences` (vision output). Plus the `mosaic_images` volume.
+- *(optional)* a **Genie Space** over these tables, usable as an agent tool — set `MOSAIC_GENIE_SPACE_ID`.
 
-## Tables written by the loop
+## Recreate the Databricks side from scratch
 
-- `workspace.default.mosaic_vision_reco` — one row per vision recommendation
-  (`visual_analysis, recommended_product, matched_product, propensity, rationale, image_generated, …`).
-- `workspace.default.mosaic_weather`, `workspace.default.mosaic_recommendations` — shared with Phase 1.
+1. **Schema.** Run `schema.sql` in a SQL editor (serverless warehouse): creates the tables, the volume, and the two UC functions.
+2. **Real-time vision job.** Import `mosaic_analyze_images.py` as a notebook, create a Job with a
+   **file-arrival trigger** on `/Volumes/workspace/default/mosaic_images/`, and unpause it. It needs no
+   internet — it calls the governed model via `mlflow-skinny` + `get_deploy_client("databricks")`.
+3. **(optional) Agent Framework agent.** In a notebook:
+   ```python
+   %pip install -U -qqqq mlflow databricks-langchain databricks-agents langgraph
+   dbutils.library.restartPython()
+   %run ./deploy_agent
+   ```
+   `deploy_agent.py` logs the agent with MLflow, registers it to `workspace.default.mosaic_vision_agent`,
+   and attempts `agents.deploy`. If deploy is blocked by serving-endpoint permissions, the model is still
+   registered in UC and the live demo continues via the direct endpoint.
 
-## Deploy (inside a Databricks notebook)
-
-```python
-%pip install -U -qqqq mlflow databricks-langchain databricks-agents langgraph
-dbutils.library.restartPython()
-%run ./deploy_agent
-```
-
-`deploy_agent.py` logs the agent with MLflow, registers it to `workspace.default.mosaic_vision_agent`,
-and attempts `agents.deploy`. If deploy is blocked by serving-endpoint permissions, the model is still
-registered in Unity Catalog and the live demo continues via the direct endpoint.
+> Not committed (workspace/UI-managed): the Genie space and the Agent Bricks Supervisor agent are built
+> in the Databricks UI, so they live in the workspace, not in this repo.
 
 ## Proof
 
