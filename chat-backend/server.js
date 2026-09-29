@@ -254,6 +254,23 @@ async function brTrack(customer_ids, properties) {
   return { ok, status: resp.status };
 }
 
+// Low-level event tracking (Public-group Token auth). Emits ONE customer event onto the profile.
+// Unlike brTrack (which updates durable properties), an event lands on the customer timeline and is what
+// a Bloomreach *scenario* trigger listens on — the mechanism that makes an email send in real time.
+async function brEvent(customer_ids, event_type, properties) {
+  const url = `${BR_API_BASE}/track/v2/projects/${BR_PROJECT_TOKEN}/customers/events`;
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Token ${BR_API_TOKEN}` },
+    body: JSON.stringify({ customer_ids, event_type, timestamp: Math.floor(Date.now() / 1000), properties: properties || {} }),
+  });
+  const body = await resp.text().catch(() => "");
+  let ok = false;
+  try { const j = JSON.parse(body); ok = !!(j.success && (!Array.isArray(j.errors) || j.errors.length === 0)); } catch {}
+  if (!ok) console.error("bloomreach event failed", resp.status, body.slice(0, 300)); // log server-side only
+  return { ok, status: resp.status };
+}
+
 async function writeBloomreach({ email, customer_id, device_id, attributes }) {
   // Model output is untrusted: allowlist keys, cap length, reject markup/template/url/control chars.
   const ALLOWED_ATTRS = {
@@ -278,6 +295,34 @@ async function writeBloomreach({ email, customer_id, device_id, attributes }) {
 
   const { ok, status } = await brTrack(ids, props);
   return { wrote: ok, props, status, identity: ids.email_id ? "email_id" : "cookie", merged: !!(ids.email_id && ids.cookie) };
+}
+
+// Emit a `user_intent` event when the shopper states a CLEAR buy-intent this message — an activity, a
+// destination, a style, or a color (e.g. "Salt Lake City hike, teal shoes"). A Bloomreach scenario
+// triggers on this event to send the cross-sell email in real time. Only intent-bearing keys count, so
+// small talk does not fire it. Model output is untrusted -> allowlist + cap length + reject markup/url/ctrl.
+const INTENT_ATTRS = {
+  favorite_activity: 60, summer_interest: 60, favorite_location: 80, preferred_location: 80,
+  style_preference: 60, favorite_color: 60,
+};
+async function emitUserIntent({ email, customer_id, device_id, attributes }) {
+  if (!BR_READY) return { intent: false };
+  const props = {};
+  for (const [k, max] of Object.entries(INTENT_ATTRS)) {
+    let v = attributes && attributes[k];
+    if (typeof v !== "string") continue;
+    v = v.trim();
+    if (!v || v.length > max) continue;
+    if (/[<>{}$\u0000-\u001f]/.test(v) || /https?:\/\//i.test(v)) continue;
+    props[k] = v;
+  }
+  // "Clear buy-intent" = at least one intent-bearing preference was stated in this message.
+  if (Object.keys(props).length === 0) return { intent: false };
+  const ids = brCustomerIds({ email, customer_id, device_id });
+  if (!ids.email_id && !ids.cookie) return { intent: false, reason: "no identity (need email or device_id)" };
+  props.source = "storefront-chat";
+  const { ok, status } = await brEvent(ids, "user_intent", props);
+  return { intent: ok, intent_status: status, intent_props: props, identity: ids.email_id ? "email_id" : "cookie" };
 }
 
 // Explicit anonymous→known merge: send ONE command carrying both cookie (device_id) and email_id so
@@ -867,10 +912,15 @@ const server = http.createServer(async (req, res) => {
 
     let wrote = { wrote: false };
     let dbx = { dbx: false };
+    let intent = { intent: false };
     if (idEmail || device_id) {
       // Known (email_id) or anonymous (cookie=device_id); passing both ids also stitches the profiles.
       try { wrote = await writeBloomreach({ email: idEmail, customer_id: trustedCustomerId, device_id, attributes }); }
       catch (e) { console.error("bloomreach write error", String(e).slice(0, 300)); wrote = { wrote: false }; }
+      // On CLEAR buy-intent, also emit a `user_intent` event — the real-time trigger a Bloomreach scenario
+      // uses to send the cross-sell email the moment the shopper states an activity/place/style/color.
+      try { intent = await emitUserIntent({ email: idEmail, customer_id: trustedCustomerId, device_id, attributes }); }
+      catch (e) { console.error("user_intent emit error", String(e).slice(0, 300)); intent = { intent: false }; }
     }
     if (idEmail) {
       // Databricks signals table is keyed on email; anonymous (device-only) signals are Bloomreach-only
@@ -878,7 +928,7 @@ const server = http.createServer(async (req, res) => {
       try { dbx = await writeDatabricks({ email: idEmail, attributes, message }); }
       catch (e) { console.error("databricks write error", String(e).slice(0, 300)); dbx = { dbx: false }; }
     }
-    return json(res, 200, { reply: finalReply, extracted: attributes, image: genImage, image_databricks: genImageDbx, ...wrote, ...dbx });
+    return json(res, 200, { reply: finalReply, extracted: attributes, image: genImage, image_databricks: genImageDbx, ...wrote, ...dbx, ...intent });
   } catch (e) {
     console.error("assistant error", String(e).slice(0, 300));
     return json(res, 500, { error: "assistant error" });
