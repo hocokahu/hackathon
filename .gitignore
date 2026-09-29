@@ -254,6 +254,8 @@ credentials.json
 client_secret*.json
 secrets.toml
 .databrickscfg
+.mcp.json
+!.mcp.json.example
 .mcp.local.json
 
 # Claude Code local settings (holds MCP secrets)
