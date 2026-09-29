@@ -11,6 +11,9 @@ no way to *see* the customer's image.
 - `mosaic_analyze_images.py` — the **live** vision job (a notebook). On file arrival in the volume it
   reads each new image, runs `databricks-claude-sonnet-4-5` vision to name the product/activity in a
   few words, and writes it to `mosaic_user_preferences.image_generation`.
+- `job.json` — the Job definition for that notebook (file-arrival trigger on the volume, unpaused).
+  Set `notebook_path` to where you imported the notebook, then create it with
+  `databricks jobs create --json @databricks/job.json`.
 - `agent.py` / `deploy_agent.py` — the Agent Framework version of the vision brain (see below). Not
   the path currently running; the live demo calls the model endpoint directly.
 
@@ -46,9 +49,10 @@ Databricks serverless here has **no outbound internet**. So:
 ## Recreate the Databricks side from scratch
 
 1. **Schema.** Run `schema.sql` in a SQL editor (serverless warehouse): creates the tables, the volume, and the two UC functions.
-2. **Real-time vision job.** Import `mosaic_analyze_images.py` as a notebook, create a Job with a
-   **file-arrival trigger** on `/Volumes/workspace/default/mosaic_images/`, and unpause it. It needs no
-   internet — it calls the governed model via `mlflow-skinny` + `get_deploy_client("databricks")`.
+2. **Real-time vision job.** Import `mosaic_analyze_images.py` as a notebook, then create the Job from
+   `job.json` (`databricks jobs create --json @databricks/job.json` — first set `notebook_path` to your
+   import location). It has a **file-arrival trigger** on `/Volumes/workspace/default/mosaic_images/`
+   and needs no internet — it calls the governed model via `mlflow-skinny` + `get_deploy_client("databricks")`.
 3. **(optional) Agent Framework agent.** In a notebook:
    ```python
    %pip install -U -qqqq mlflow databricks-langchain databricks-agents langgraph
